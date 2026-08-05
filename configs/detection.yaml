@@ -1,0 +1,17 @@
+point_clouds:
+  scenario1_room1_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario1_room1_indoor.ply
+  scenario1_room1_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario1_room1_outdoor.ply
+  scenario1_room2_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario1_room2_indoor.ply
+  scenario1_room2_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario1_room2_outdoor.ply
+  scenario2_room1_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room1_indoor.ply
+  scenario2_room1_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room1_outdoor.ply
+  scenario2_room2_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room2_indoor.ply
+  scenario2_room2_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room2_outdoor.ply
+  scenario2_room3_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room3_indoor.ply
+  scenario2_room3_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room3_outdoor.ply
+  scenario2_room4_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room4_indoor.ply
+  scenario2_room4_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room4_outdoor.ply
+  scenario2_room5_indoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room5_indoor.ply
+  scenario2_room5_outdoor: data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario2_room5_outdoor.ply
+
+output_dir: outputs

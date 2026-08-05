@@ -1,0 +1,9 @@
+# Manual ground-truth window/door annotations for scenario1_room1_outdoor.
+# Same format as scenario1_room1_indoor.yaml - see that file for instructions.
+
+openings:
+  - category: door
+    center: [0.0, 0.0, 0.0]
+    width: 0.9
+    height: 2.1
+    normal: [1.0, 0.0, 0.0]

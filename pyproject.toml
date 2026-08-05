@@ -1,0 +1,23 @@
+[project]
+name = "sgd-alignment"
+version = "0.1.0"
+description = "Indoor-outdoor point cloud alignment using semantic-geometric descriptors"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy",
+    "scipy",
+    "open3d",
+    "plyfile",
+    "matplotlib",
+    "pyyaml",
+]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]

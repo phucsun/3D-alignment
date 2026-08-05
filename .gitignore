@@ -1,0 +1,15 @@
+.DS_Store
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Large data & model artifacts
+data/
+weights/
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.db3
+*.pdf

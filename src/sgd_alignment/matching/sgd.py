@@ -1,0 +1,279 @@
+"""Semantic-Geometric Descriptor (SGD) construction and matching (Section 3.2, 4).
+
+Verified against Yang et al., "Indoor-Outdoor Point Cloud Alignment Using
+Semantic-Geometric Descriptor", Remote Sens. 2022, 14, 5119.
+
+For object i, its SGDU (semantic-geometric descriptor unit) is (S^i, G^i),
+where S^i is i's own category and G^i holds one 8-component group {^jG^i}
+per other object j in the same scene:
+
+    1. S^j          - j's category
+    2. d_i^j        - Euclidean distance between the origins (centers) of
+                      i's and j's local coordinates
+    3-5. alpha, beta, theta - angles between the vector (center_j -
+                      center_i) and the x, y, z axes *of O_i's own local
+                      frame* (Section 3.2, Figure 5)
+    6-8. rotx, roty, rotz  - Euler angles of the relative rotation that
+                      takes O_i's local frame to O_j's local frame
+
+All 8 are invariant to the (unknown) rigid transform between the indoor
+and outdoor scans, since rotating/translating the whole scene moves both
+centers and both local frames identically.
+
+Matching (Section 4) is two-level bipartite assignment, both solved with
+the Hungarian algorithm (`scipy.optimize.linear_sum_assignment`, which
+natively handles rectangular cost matrices - this plays the role of the
+paper's "improved Hungarian algorithm" for unequal set sizes without
+needing its brute-force subset search):
+
+  - inner level (Algorithm 2): for one candidate pair (object k in scene
+    1, object l in scene 2), the distance between their SGDUs is itself
+    the cost of the best assignment between k's (N-1) neighbor-groups and
+    l's neighbor-groups - i.e. a full Hungarian match of the two
+    "distribution patterns", not just a naive nearest-to-nearest
+    comparison. A component exceeding its own threshold, or the two
+    neighbor's categories disagreeing, makes that pairing invalid (cost
+    infinity); if the whole row/column is invalid the pair can't be
+    matched at all (SGDU distance = infinity).
+  - outer level (Algorithm 3 / Section 4.2): the same Hungarian matching
+    is applied again across all (indoor object, outdoor object) pairs,
+    using the inner-level distances as the cost matrix, to get the final
+    object correspondences. All-invalid rows/columns are dropped first
+    (handles indoor/outdoor detecting different numbers of openings).
+
+NOTE: the paper does not publish numeric values for the lambda weights or
+the per-component thresholds (they were presumably tuned empirically on
+the authors' data) - the defaults below are reasonable starting points
+that need calibrating against real annotated data, not values taken from
+the paper itself.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+
+import numpy as np
+from scipy.optimize import linear_sum_assignment
+from scipy.spatial.transform import Rotation
+
+from sgd_alignment.common.types import Detection3D
+
+EULER_ORDER = "xyz"
+INFEASIBLE = float("inf")
+_LARGE_FINITE_COST = 1e9
+
+
+@dataclass
+class PairWeights:
+    """lambda_1..7 in Equation (2), and their 7 independent rejection
+    thresholds - one pair per geometric error term (d, alpha, beta, theta,
+    rotx, roty, rotz), matching the paper's Equation (2) exactly rather
+    than sharing one weight/threshold across the 3 direction angles or the
+    3 rotation angles.
+    """
+
+    distance_weight: float = 1.0
+    alpha_weight: float = 0.4
+    beta_weight: float = 0.4
+    theta_weight: float = 0.4
+    rotx_weight: float = 0.4
+    roty_weight: float = 0.4
+    rotz_weight: float = 0.4
+
+    distance_threshold: float = 1.5  # meters
+    alpha_threshold: float = np.pi / 3
+    beta_threshold: float = np.pi / 3
+    theta_threshold: float = np.pi / 3
+    rotx_threshold: float = np.pi / 3
+    roty_threshold: float = np.pi / 3
+    rotz_threshold: float = np.pi / 3
+
+    @property
+    def angle_weights(self) -> np.ndarray:
+        return np.array([self.alpha_weight, self.beta_weight, self.theta_weight])
+
+    @property
+    def angle_thresholds(self) -> np.ndarray:
+        return np.array([self.alpha_threshold, self.beta_threshold, self.theta_threshold])
+
+    @property
+    def rotation_weights(self) -> np.ndarray:
+        return np.array([self.rotx_weight, self.roty_weight, self.rotz_weight])
+
+    @property
+    def rotation_thresholds(self) -> np.ndarray:
+        return np.array([self.rotx_threshold, self.roty_threshold, self.rotz_threshold])
+
+
+@dataclass
+class PairFeature:
+    """The 8-component {^jG^i} group: object i described relative to neighbor j."""
+
+    label: str  # S^j
+    distance: float  # d_i^j
+    direction_angles: np.ndarray  # (3,) alpha, beta, theta - in O_i's own frame
+    relative_euler_angles: np.ndarray  # (3,) rotx, roty, rotz
+
+
+@dataclass
+class SGD:
+    """SGDU for one object: its own category plus its PairFeature group G^i
+    against every other object in the scene."""
+
+    detection: Detection3D
+    neighbors: list[PairFeature] = field(default_factory=list)
+
+
+def _local_frame(det: Detection3D) -> np.ndarray:
+    """3x3 rotation matrix whose columns are (x, y, z) in the paper's own
+    convention (Figure 3): x = normal (points outside), y = u_axis (right-
+    hand rule from z and x), z = v_axis (points up). Column order matters
+    here (not just which 3 vectors are included), since alpha/beta/theta
+    and rotx/roty/rotz are indexed against this exact x-y-z ordering.
+    """
+    return np.stack([det.normal, det.u_axis, det.v_axis], axis=1)
+
+
+def _pair_feature(i: Detection3D, j: Detection3D) -> PairFeature:
+    offset = j.center - i.center
+    distance = float(np.linalg.norm(offset))
+    direction = offset / distance if distance > 1e-12 else offset
+
+    frame_i = _local_frame(i)
+    direction_angles = np.arccos(np.clip(direction @ frame_i, -1.0, 1.0))
+
+    frame_j = _local_frame(j)
+    r_rel = frame_i.T @ frame_j
+    relative_euler_angles = Rotation.from_matrix(r_rel).as_euler(EULER_ORDER)
+
+    return PairFeature(
+        label=j.category,
+        distance=distance,
+        direction_angles=direction_angles,
+        relative_euler_angles=relative_euler_angles,
+    )
+
+
+def build_sgds(detections: list[Detection3D]) -> list[SGD]:
+    """Build one SGDU per detection: its PairFeature group against every
+    other detection in the same scene (order doesn't matter here - the
+    inner Hungarian match in `sgdu_distance` doesn't assume any)."""
+    sgds = []
+    for i, det in enumerate(detections):
+        neighbors = [_pair_feature(det, detections[j]) for j in range(len(detections)) if j != i]
+        sgds.append(SGD(detection=det, neighbors=neighbors))
+    return sgds
+
+
+def _pair_feature_cost(a: PairFeature, b: PairFeature, w: PairWeights) -> float:
+    """Equation (2): the cost of matching neighbor-group a to neighbor-group b."""
+    if a.label != b.label:
+        return INFEASIBLE
+
+    d_e = abs(a.distance - b.distance)
+    angle_e = np.abs(a.direction_angles - b.direction_angles)  # (alpha_e, beta_e, theta_e)
+    rot_e = np.abs(a.relative_euler_angles - b.relative_euler_angles)  # (rotx_e, roty_e, rotz_e)
+
+    if d_e > w.distance_threshold:
+        return INFEASIBLE
+    if np.any(angle_e > w.angle_thresholds):
+        return INFEASIBLE
+    if np.any(rot_e > w.rotation_thresholds):
+        return INFEASIBLE
+
+    return (
+        w.distance_weight * d_e
+        + float(np.dot(w.angle_weights, angle_e))
+        + float(np.dot(w.rotation_weights, rot_e))
+    )
+
+
+def _assign_rectangular(cost: np.ndarray) -> tuple[float, int]:
+    """Solve a (possibly non-square, possibly-infeasible-entry) assignment
+    problem, dropping all-infeasible rows/columns first (as the paper
+    does before applying the Hungarian algorithm). Returns (mean cost per
+    feasible matched pair, number of feasible matched pairs).
+
+    Mean rather than total: a candidate pair that only manages to match 1
+    of 6 possible neighbors isn't more similar than one matching 5 of 6 -
+    summing raw cost would perversely favor matching *fewer* neighbors
+    (fewer terms added up), since each excluded pair contributes nothing
+    to the sum instead of being penalized for not being comparable at all.
+    """
+    if cost.size == 0:
+        return INFEASIBLE, 0
+
+    valid_rows = ~np.all(np.isinf(cost), axis=1)
+    valid_cols = ~np.all(np.isinf(cost), axis=0)
+    sub = cost[np.ix_(valid_rows, valid_cols)]
+    if sub.size == 0:
+        return INFEASIBLE, 0
+
+    finite_sub = np.where(np.isinf(sub), _LARGE_FINITE_COST, sub)
+    row_idx, col_idx = linear_sum_assignment(finite_sub)
+
+    total_cost = 0.0
+    num_matched = 0
+    for r, c in zip(row_idx, col_idx):
+        if not np.isinf(sub[r, c]):
+            total_cost += sub[r, c]
+            num_matched += 1
+
+    if num_matched == 0:
+        return INFEASIBLE, 0
+    return total_cost / num_matched, num_matched
+
+
+def sgdu_distance(a: SGD, b: SGD, weights: PairWeights | None = None) -> tuple[float, int]:
+    """Algorithm 2: the distance between two SGDUs.
+
+    This is itself the cost of the best assignment between a's neighbor
+    groups and b's neighbor groups (the inner Hungarian match) - not a
+    naive position-by-position comparison, since neither scene's object
+    ordering means anything and the two objects may have different
+    numbers of neighbors.
+    """
+    if a.detection.category != b.detection.category:
+        return INFEASIBLE, 0
+
+    weights = weights or PairWeights()
+    cost = np.array([[_pair_feature_cost(fa, fb, weights) for fb in b.neighbors] for fa in a.neighbors])
+    return _assign_rectangular(cost)
+
+
+def match_sgds(
+    indoor_sgds: list[SGD],
+    outdoor_sgds: list[SGD],
+    weights: PairWeights | None = None,
+    max_cost: float = 5.0,
+) -> list[tuple[int, int, float]]:
+    """Algorithm 3 (matching phase): match indoor SGDUs to outdoor SGDUs.
+
+    Builds the adjacency matrix of SGDU-to-SGDU distances (Equation 3),
+    drops all-infeasible rows/columns, then runs the Hungarian algorithm
+    once more at this outer level. Returns (indoor_index, outdoor_index,
+    cost) triples for accepted matches - pairs whose cost still exceeds
+    `max_cost` after assignment are dropped (no real counterpart existed).
+    """
+    if not indoor_sgds or not outdoor_sgds:
+        return []
+    weights = weights or PairWeights()
+
+    cost = np.array([[sgdu_distance(a, b, weights)[0] for b in outdoor_sgds] for a in indoor_sgds])
+
+    valid_rows = ~np.all(np.isinf(cost), axis=1)
+    valid_cols = ~np.all(np.isinf(cost), axis=0)
+    row_ids = np.where(valid_rows)[0]
+    col_ids = np.where(valid_cols)[0]
+    sub = cost[np.ix_(valid_rows, valid_cols)]
+    if sub.size == 0:
+        return []
+
+    finite_sub = np.where(np.isinf(sub), _LARGE_FINITE_COST, sub)
+    row_idx, col_idx = linear_sum_assignment(finite_sub)
+
+    matches = []
+    for r, c in zip(row_idx, col_idx):
+        if np.isinf(sub[r, c]) or sub[r, c] > max_cost:
+            continue
+        matches.append((int(row_ids[r]), int(col_ids[c]), float(sub[r, c])))
+    return matches

@@ -1,0 +1,27 @@
+# Manual ground-truth window/door annotations for scenario1_room1_indoor.
+#
+# How to fill this in (e.g. in CloudCompare):
+#   1. Open data/Indoor-Outdoor-Point-Cloud-Dataset-main/scenario1_room1_indoor.ply
+#   2. Use the point-picking tool to click the CENTER of each window/door
+#      opening (on the wall surface) and read off its x, y, z.
+#   3. Estimate width (extent along the wall) and height (vertical extent)
+#      in meters by picking two more points at the opening's edges and
+#      taking the distance, or just a visual estimate.
+#   4. normal: the wall's outward-facing direction at that point (doesn't
+#      need to be exact - one of +/-X, +/-Y is usually close enough since
+#      these rooms are axis-aligned; run plane_fitting on the wall if you
+#      want the precise value instead).
+#
+# category must be "door" or "window".
+
+openings:
+  - category: door
+    center: [0.0, 0.0, 0.0]
+    width: 0.9
+    height: 2.1
+    normal: [1.0, 0.0, 0.0]
+  # - category: window
+  #   center: [x, y, z]
+  #   width: 1.2
+  #   height: 1.2
+  #   normal: [0.0, 1.0, 0.0]
