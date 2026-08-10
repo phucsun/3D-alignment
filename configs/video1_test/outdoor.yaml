@@ -1,0 +1,21 @@
+source:
+  backend: da3
+  npz_path: data/video1_v1/results.npz
+
+selected_views: []
+is_outdoor: true
+scale: 1.0
+# up-vector tự động ước lượng bị sai cho scene này (hành lang thiếu sàn/trần
+# trong khung hình) - dùng lại up của phía indoor, đã xác nhận 2 lần chạy DA3
+# này chung 1 hệ trục toạ độ (dot product = 0.999 giữa 2 up ước lượng độc lập)
+up: [-0.032, 0.994, 0.102]
+merge_distance: 0.6
+depth_range: [0.05, 30.0]
+
+output_dir: outputs/video1_test
+output_name: outdoor
+
+segmenter:
+  text_prompt: "door. window."
+  box_threshold: 0.5
+  text_threshold: 0.25

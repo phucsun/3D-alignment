@@ -117,12 +117,22 @@ def estimate_up_vector_manhattan(
     Assumes a Manhattan-world room (floor/ceiling + two wall directions,
     mutually perpendicular): extracts the largest planes regardless of
     orientation, groups them into up to 3 axis clusters by normal direction
-    (a plane and its mirror -normal belong to the same axis), and picks the
-    axis with the greatest *total inlier point count* as up - floor+ceiling
-    together are typically the most completely captured, least obstructed
-    flat surfaces in a room (unlike walls, which are broken up by windows,
-    doors and furniture), so they dominate by point count even though any
-    single wall segment can be large too.
+    (a plane and its mirror -normal belong to the same axis), then picks
+    the axis along which the *whole point cloud's spatial extent* (max -
+    min projection) is smallest - a room or corridor is almost always
+    shorter floor-to-ceiling than it is long/wide, so this holds even for
+    unusual point distributions.
+
+    An earlier version picked the axis with the greatest total inlier
+    point count instead (floor+ceiling are typically the most completely
+    captured, least obstructed flat surfaces, unlike walls broken up by
+    windows/doors/furniture) - but this fails for a long corridor, where
+    the two long wall planes can accumulate more total points than
+    floor+ceiling despite not being the vertical axis (confirmed on real
+    data: a corridor with height extent 9.1 m still had its wall-normal
+    axis carry more RANSAC inlier points than its floor/ceiling axis,
+    silently picking the wrong axis as "up"). Spatial extent doesn't have
+    that failure mode.
     """
     planes = _extract_planes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations)
     if not planes:
@@ -130,20 +140,13 @@ def estimate_up_vector_manhattan(
 
     planes_sorted = sorted(planes, key=lambda p: -len(p.inlier_indices))
     axes: list[np.ndarray] = []
-    axis_points: list[int] = []
 
     for p in planes_sorted:
-        matched = False
-        for i, axis in enumerate(axes):
-            if abs(float(np.dot(p.normal, axis))) >= same_axis_dot:
-                axis_points[i] += len(p.inlier_indices)
-                matched = True
-                break
-        if not matched:
+        if not any(abs(float(np.dot(p.normal, axis))) >= same_axis_dot for axis in axes):
             axes.append(p.normal)
-            axis_points.append(len(p.inlier_indices))
 
-    best_axis = axes[int(np.argmax(axis_points))]
+    extents = [(pc.points @ axis).max() - (pc.points @ axis).min() for axis in axes]
+    best_axis = axes[int(np.argmin(extents))]
     return best_axis / np.linalg.norm(best_axis)
 
 

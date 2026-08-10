@@ -10,10 +10,26 @@ dependencies = [
     "plyfile",
     "matplotlib",
     "pyyaml",
+    "opencv-python",
 ]
 
 [project.optional-dependencies]
 dev = ["pytest"]
+# only needed for sgd_alignment.detection.segment_2d (Grounding DINO + SAM2
+# 2D door/window detection) - the rest of the package (pose/depth reading,
+# backprojection, matching) has no dependency on these heavy ML libs.
+segmentation = [
+    "torch",
+    "torchvision",
+    "transformers",
+    "timm",
+    "accelerate",
+    "ultralytics",
+]
+
+[project.scripts]
+sgd-multiview-pipeline = "sgd_alignment.pipelines.multiview_pipeline:main"
+sgd-align-pipeline = "sgd_alignment.pipelines.align_pipeline:main"
 
 [build-system]
 requires = ["setuptools>=68"]

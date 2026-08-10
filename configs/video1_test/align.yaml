@@ -1,0 +1,11 @@
+indoor_detections: outputs/video1_test/indoor_detections.pkl
+indoor_scene_ply: outputs/video1_test/indoor_scene.ply
+outdoor_detections: outputs/video1_test/outdoor_detections.pkl
+outdoor_scene_ply: outputs/video1_test/outdoor_scene.ply
+
+output_dir: outputs/video1_test
+output_name: aligned
+
+estimate_scale: true
+normalize_distance: true
+max_cost: 5.0

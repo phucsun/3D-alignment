@@ -14,11 +14,9 @@ per other object j in the same scene:
                       center_i) and the x, y, z axes *of O_i's own local
                       frame* (Section 3.2, Figure 5)
     6-8. rotx, roty, rotz  - Euler angles of the relative rotation that
+
                       takes O_i's local frame to O_j's local frame
 
-All 8 are invariant to the (unknown) rigid transform between the indoor
-and outdoor scans, since rotating/translating the whole scene moves both
-centers and both local frames identically.
 
 Matching (Section 4) is two-level bipartite assignment, both solved with
 the Hungarian algorithm (`scipy.optimize.linear_sum_assignment`, which
@@ -133,10 +131,11 @@ def _local_frame(det: Detection3D) -> np.ndarray:
     return np.stack([det.normal, det.u_axis, det.v_axis], axis=1)
 
 
-def _pair_feature(i: Detection3D, j: Detection3D) -> PairFeature:
+def _pair_feature(i: Detection3D, j: Detection3D, distance_scale: float = 1.0) -> PairFeature:
     offset = j.center - i.center
-    distance = float(np.linalg.norm(offset))
-    direction = offset / distance if distance > 1e-12 else offset
+    raw_distance = float(np.linalg.norm(offset))
+    direction = offset / raw_distance if raw_distance > 1e-12 else offset
+    distance = raw_distance / distance_scale
 
     frame_i = _local_frame(i)
     direction_angles = np.arccos(np.clip(direction @ frame_i, -1.0, 1.0))
@@ -153,13 +152,46 @@ def _pair_feature(i: Detection3D, j: Detection3D) -> PairFeature:
     )
 
 
-def build_sgds(detections: list[Detection3D]) -> list[SGD]:
+def _scene_distance_scale(detections: list[Detection3D]) -> float:
+    """Median pairwise center-to-center distance within one scene - a
+    characteristic "unit" of that scene's own layout, used by
+    `build_sgds(..., normalize_distance=True)` to make the descriptor's
+    distance component scale-invariant.
+
+    Needed when indoor and outdoor come from two independently, arbitrarily
+    scaled reconstructions with no shared metric reference (e.g. two
+    separate feed-forward depth-model inference runs): comparing raw
+    `distance` values between the two sides is then comparing different,
+    unrelated units. Dividing every distance by this scene-local median
+    turns it into a dimensionless ratio ("how far, relative to how objects
+    in *this* scene are typically spaced") that's comparable across scenes
+    regardless of their absolute scale.
+    """
+    if len(detections) < 2:
+        return 1.0
+    centers = np.array([d.center for d in detections])
+    diffs = centers[:, None, :] - centers[None, :, :]
+    dists = np.linalg.norm(diffs, axis=-1)
+    iu = np.triu_indices(len(centers), k=1)
+    scale = float(np.median(dists[iu]))
+    return scale if scale > 1e-9 else 1.0
+
+
+def build_sgds(detections: list[Detection3D], normalize_distance: bool = False) -> list[SGD]:
     """Build one SGDU per detection: its PairFeature group against every
     other detection in the same scene (order doesn't matter here - the
-    inner Hungarian match in `sgdu_distance` doesn't assume any)."""
+    inner Hungarian match in `sgdu_distance` doesn't assume any).
+
+    `normalize_distance=False` (default) keeps the exact prior behavior
+    (raw metric distances) - needed for the already-verified real-world
+    datasets where indoor/outdoor share a common metric scale. See
+    `_scene_distance_scale` for what `normalize_distance=True` fixes and
+    when it's actually needed.
+    """
+    scale = _scene_distance_scale(detections) if normalize_distance else 1.0
     sgds = []
     for i, det in enumerate(detections):
-        neighbors = [_pair_feature(det, detections[j]) for j in range(len(detections)) if j != i]
+        neighbors = [_pair_feature(det, detections[j], scale) for j in range(len(detections)) if j != i]
         sgds.append(SGD(detection=det, neighbors=neighbors))
     return sgds
 

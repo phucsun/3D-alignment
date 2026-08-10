@@ -1,0 +1,27 @@
+# Config cho src/sgd_alignment/pipelines/align_pipeline.py
+# Chạy sau khi đã có <name>_detections.pkl + <name>_scene.ply cho CẢ 2 phía
+# (từ sgd-multiview-pipeline).
+#
+# Chạy: python -m sgd_alignment.pipelines.align_pipeline --config <file này>
+
+indoor_detections: outputs/indoor_detections.pkl
+indoor_scene_ply: outputs/indoor_scene.ply
+outdoor_detections: outputs/outdoor_detections.pkl
+outdoor_scene_ply: outputs/outdoor_scene.ply
+
+output_dir: outputs
+output_name: aligned
+
+# true khi indoor/outdoor đến từ 2 lần dựng 3D (DA3/COLMAP) độc lập, không
+# chung 1 hệ scale - trường hợp thường gặp nhất. Đặt false nếu cả 2 phía
+# chắc chắn cùng 1 đơn vị mét thật (vd cùng dựng 1 lần, hoặc CloudCompare).
+estimate_scale: true
+normalize_distance: true
+
+max_cost: 5.0
+
+# tuỳ chọn: ghi đè 1 vài ngưỡng/trọng số của PairWeights nếu cần, ví dụ
+# khi normalize_distance=true thì distance_threshold nên là TỈ LỆ tương đối
+# (so với khoảng cách trung vị giữa các vật thể trong scene), không phải mét.
+# weights:
+#   distance_threshold: 0.5

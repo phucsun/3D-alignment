@@ -1,0 +1,41 @@
+# Config cho src/sgd_alignment/pipelines/multiview_pipeline.py
+# Chạy: python -m sgd_alignment.pipelines.multiview_pipeline --config <file này>
+#
+# Copy file này thành 1 file riêng cho từng scene (vd configs/indoor.yaml,
+# configs/outdoor.yaml) và chỉnh lại - is_outdoor phải KHÁC nhau giữa 2 file
+# của cùng 1 cặp indoor/outdoor.
+
+source:
+  backend: da3  # "da3" hoặc "colmap"
+
+  # --- backend: da3 ---
+  npz_path: workspace/cua_sau_pantry/results.npz
+
+  # --- backend: colmap (bỏ qua nếu dùng da3) ---
+  # sparse_dir: data/colmap/dense/sparse       # cameras.bin/.txt + images.bin/.txt (đã undistort)
+  # images_dir: data/colmap/dense/images       # ảnh undistort khớp với sparse_dir
+  # depth_maps_dir: data/colmap/dense/stereo/depth_maps
+  # scene_ply: data/colmap/dense/fused.ply     # point cloud dense đã fuse (colmap stereo_fusion)
+
+# ảnh/view nào cần segment (chọn tay). [] = dùng tất cả view có trong source.
+selected_views: []       # da3: index view, vd [0, 2, 5]
+selected_images: []      # colmap: tên file ảnh, vd ["frame_0012.jpg"]
+
+is_outdoor: false
+scale: 1.0                # hệ số quy đổi sang mét thật - có thể để 1.0 nếu dùng
+                           # estimate_scale=True/normalize_distance=True ở bước matching
+merge_distance: 0.6       # gộp instance cùng vật thể thấy từ nhiều view (đơn vị: scale đã áp)
+depth_range: [0.05, 30.0]
+
+output_dir: outputs
+output_name: indoor       # -> outputs/indoor_detections.pkl, outputs/indoor_openings.ply
+
+segmenter:
+  text_prompt: "door. window."
+  box_threshold: 0.5
+  text_threshold: 0.25
+  nms_iou_thres: 0.7
+  cross_label_iou_thres: 0.7
+  gdino_model_id: "IDEA-Research/grounding-dino-base"
+  sam_model_id: "sam2.1_b.pt"
+  # device: cuda   # để trống = tự chọn mps/cuda/cpu

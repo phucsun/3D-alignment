@@ -1,0 +1,17 @@
+source:
+  backend: da3
+  npz_path: data/video1_v3/results.npz
+
+selected_views: []
+is_outdoor: false
+scale: 1.0
+merge_distance: 0.6
+depth_range: [0.05, 30.0]
+
+output_dir: outputs/video1_test
+output_name: indoor
+
+segmenter:
+  text_prompt: "door. window."
+  box_threshold: 0.5
+  text_threshold: 0.25

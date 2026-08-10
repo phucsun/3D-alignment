@@ -49,7 +49,7 @@ class Plane:
     """
 
     normal: np.ndarray  # (3,) unit normal
-    d: float
+    d: float # distance from the world-coordinate origin to the plane along the normal
     inlier_indices: np.ndarray  # indices into the source PointCloud
 
     def __post_init__(self) -> None:

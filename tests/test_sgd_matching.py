@@ -1,4 +1,5 @@
 import numpy as np
+import pytest
 
 from sgd_alignment.common.types import Detection3D
 from sgd_alignment.matching.alignment import align_indoor_outdoor, estimate_rigid_transform, transform_points
@@ -246,3 +247,88 @@ def test_align_indoor_outdoor_ignores_unmatched_extra_opening():
     assert len(result.matches) == 3
     matched_indoor_idxs = {m[0] for m in result.matches}
     assert 3 not in matched_indoor_idxs
+
+
+def test_estimate_rigid_transform_recovers_known_scale():
+    """estimate_scale=True (Umeyama) must recover the true scale factor
+    between src and dst - needed when they come from two independently,
+    arbitrarily scaled reconstructions with no shared metric reference
+    (e.g. two separate feed-forward depth-model inference runs)."""
+    rng = np.random.default_rng(3)
+    src = rng.uniform(-5, 5, size=(6, 3))
+    R_true = _random_rotation(4)
+    t_true = np.array([2.0, -1.0, 4.0])
+    true_scale = 2.4
+    dst = transform_points(src, true_scale * R_true, t_true)
+
+    R, t = estimate_rigid_transform(src, dst, estimate_scale=True)
+    recovered_scale = np.linalg.norm(R, axis=0).mean()
+
+    assert np.isclose(recovered_scale, true_scale, atol=1e-6)
+    assert np.allclose(R / recovered_scale, R_true, atol=1e-6)
+    assert np.allclose(t, t_true, atol=1e-6)
+
+    # without estimate_scale, a pure rotation cannot fit scaled data - the
+    # fit is systematically biased (large residual), proving this is
+    # actually needed and not just a harmless no-op to add
+    R_no_scale, t_no_scale = estimate_rigid_transform(src, dst, estimate_scale=False)
+    biased_residual = np.linalg.norm(transform_points(src, R_no_scale, t_no_scale) - dst, axis=1).mean()
+    assert biased_residual > 1.0
+
+
+def test_align_indoor_outdoor_recovers_transform_when_outdoor_is_independently_scaled():
+    """Simulates 2 separate feed-forward depth-model inference runs (e.g.
+    2 independent DA3 sessions, one for indoor and one for outdoor) with
+    no shared metric reference - outdoor's whole coordinate frame is an
+    unrelated absolute scale from indoor's. Plain `align_indoor_outdoor`
+    (raw metric distances, pure-rotation Kabsch) must fail outright on
+    this; `normalize_distance=True` + `estimate_scale=True` must recover
+    both the correct correspondences and the true scale/rotation/translation.
+    """
+    indoor_centers = np.array([
+        [0.0, 0.0, 1.0],
+        [3.0, 0.2, 1.0],
+        [0.4, 4.0, 1.2],
+        [3.3, 4.7, 1.1],
+        [1.5, 2.3, 0.9],
+    ])
+    categories = ["door", "window", "window", "window", "door"]
+    indoor = [
+        _make_detection(c, p, 0.9 if c == "door" else 1.1, 2.1 if c == "door" else 1.0)
+        for c, p in zip(categories, indoor_centers)
+    ]
+
+    R_true = _random_rotation(11)
+    t_true = np.array([50.0, -30.0, 5.0])
+    true_scale = 2.4  # outdoor's independent reconstruction has its own unrelated absolute scale
+    perm = [3, 1, 4, 0, 2]
+    outdoor = []
+    for idx in perm:
+        c = transform_points(indoor_centers[idx : idx + 1], true_scale * R_true, t_true)[0]
+        d = _make_detection(
+            categories[idx], c,
+            indoor[idx].width * true_scale, indoor[idx].height * true_scale,
+        )
+        d.normal[:] = R_true @ indoor[idx].normal
+        d.u_axis[:] = R_true @ indoor[idx].u_axis
+        d.v_axis[:] = R_true @ indoor[idx].v_axis
+        outdoor.append(d)
+
+    # plain call (default params) must fail - raw distances differ by
+    # ~2.4x between the two sides, exceeding the default (meter-scale)
+    # distance_threshold for every candidate pair
+    with pytest.raises(ValueError):
+        align_indoor_outdoor(indoor, outdoor, max_cost=1.0)
+
+    weights = PairWeights(distance_threshold=0.3)  # now a relative ratio, not meters
+    result = align_indoor_outdoor(
+        indoor, outdoor, weights=weights, max_cost=1.0,
+        estimate_scale=True, normalize_distance=True,
+    )
+
+    assert len(result.matches) == 5
+    for indoor_idx, outdoor_idx, _cost in result.matches:
+        assert perm[indoor_idx] == outdoor_idx
+    assert np.isclose(result.scale, true_scale, atol=1e-3)
+    assert np.allclose(result.R / result.scale, R_true, atol=1e-4)
+    assert np.allclose(result.t, t_true, atol=1e-2)
