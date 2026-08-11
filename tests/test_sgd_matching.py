@@ -2,7 +2,12 @@ import numpy as np
 import pytest
 
 from sgd_alignment.common.types import Detection3D
-from sgd_alignment.matching.alignment import align_indoor_outdoor, estimate_rigid_transform, transform_points
+from sgd_alignment.matching.alignment import (
+    align_indoor_outdoor,
+    estimate_rigid_transform,
+    refine_matches_with_geometric_consensus,
+    transform_points,
+)
 from sgd_alignment.matching.sgd import PairWeights, build_sgds, match_sgds, sgdu_distance
 
 
@@ -249,6 +254,58 @@ def test_align_indoor_outdoor_ignores_unmatched_extra_opening():
     assert 3 not in matched_indoor_idxs
 
 
+def test_refine_matches_with_geometric_consensus_fixes_local_symmetric_swap():
+    """A row of evenly-spaced near-identical windows is exactly where pure
+    SGD (local relative-geometry) matching can confuse 2 neighbors -
+    confirmed on real data (sc1-room2: 2/7 windows swapped, ~2.96m
+    residual, every other match correct and under 5cm - SGD matching
+    alone never fixed it).
+
+    Simulate that failure mode directly rather than relying on real data
+    in a test: build the TRUE correspondence, then hand
+    `refine_matches_with_geometric_consensus` a `matches` list with 2
+    same-category entries deliberately swapped (as if SGD had confused
+    them) among 5 correct ones. The refiner doesn't get told which ones
+    are wrong - it must recover that from (R, t) fit to the majority.
+    """
+    indoor_centers = np.array([
+        [0.0, 3.0, 1.0],   # door, off the line so the whole set isn't collinear
+        [2.0, 0.0, 1.0], [4.0, 0.0, 1.0], [6.0, 0.0, 1.0],
+        [8.0, 0.0, 1.0], [10.0, 0.0, 1.0], [12.0, 0.0, 1.0],  # 6 evenly-spaced windows
+    ])
+    categories = ["door", "window", "window", "window", "window", "window", "window"]
+    indoor = [_make_detection(c, p, 0.9 if c == "door" else 1.1, 2.1 if c == "door" else 1.0)
+              for c, p in zip(categories, indoor_centers)]
+
+    R_true = _random_rotation(7)
+    t_true = np.array([5.0, 2.0, 1.0])
+    outdoor_centers = transform_points(indoor_centers, R_true, t_true)
+    outdoor = [_make_detection(c, p, d.width, d.height) for c, p, d in zip(categories, outdoor_centers, indoor)]
+    for d_out, d_in in zip(outdoor, indoor):
+        d_out.normal[:] = R_true @ d_in.normal
+        d_out.u_axis[:] = R_true @ d_in.u_axis
+        d_out.v_axis[:] = R_true @ d_in.v_axis
+
+    wrong_matches = [(i, i, 0.0) for i in range(7)]
+    wrong_matches[2] = (2, 5, 0.0)  # simulate SGD confusing 2 evenly-spaced windows
+    wrong_matches[5] = (5, 2, 0.0)
+
+    refined, R, t = refine_matches_with_geometric_consensus(indoor, outdoor, wrong_matches)
+
+    assert {i: j for i, j, _ in refined} == {i: i for i in range(7)}
+    assert np.allclose(R, R_true, atol=1e-4)
+    assert np.allclose(t, t_true, atol=1e-4)
+
+
+def test_refine_matches_with_geometric_consensus_noop_below_3_matches():
+    indoor = [_make_detection("door", np.array([0.0, 0.0, 0.0]), 0.9, 2.1)]
+    outdoor = [_make_detection("door", np.array([1.0, 0.0, 0.0]), 0.9, 2.1)]
+    matches = [(0, 0, 0.0)]
+    refined, R, t = refine_matches_with_geometric_consensus(indoor, outdoor, matches)
+    assert refined == matches
+    assert R is None and t is None
+
+
 def test_estimate_rigid_transform_recovers_known_scale():
     """estimate_scale=True (Umeyama) must recover the true scale factor
     between src and dst - needed when they come from two independently,
@@ -332,3 +389,42 @@ def test_align_indoor_outdoor_recovers_transform_when_outdoor_is_independently_s
     assert np.isclose(result.scale, true_scale, atol=1e-3)
     assert np.allclose(result.R / result.scale, R_true, atol=1e-4)
     assert np.allclose(result.t, t_true, atol=1e-2)
+
+
+def test_align_indoor_outdoor_intrinsic_fallback_matches_single_isolated_opening():
+    """The exact real failure mode this fallback targets: a scene with
+    only 1 detected opening has an empty G^i (no neighbors), so ordinary
+    SGD matching can never propose a match for it at all - confirmed on
+    real data (a home capture where the outdoor scan only had 1 detected
+    door out of 2 physical ones): `align_indoor_outdoor` raised "0
+    opening(s) matched" even though the single detection itself was
+    perfectly correct.
+    """
+    indoor = [_make_detection("door", np.array([0.0, 0.0, 1.0]), 0.9, 2.1)]
+
+    R_true = _random_rotation(11)
+    t_true = np.array([3.0, -1.0, 0.5])
+    outdoor_center = transform_points(indoor[0].center[None, :], R_true, t_true)[0]
+    outdoor = [_make_detection("door", outdoor_center, 0.9, 2.1)]
+    outdoor[0].normal[:] = R_true @ indoor[0].normal
+    outdoor[0].u_axis[:] = R_true @ indoor[0].u_axis
+    outdoor[0].v_axis[:] = R_true @ indoor[0].v_axis
+
+    # default: still fails exactly as before (no regression)
+    with pytest.raises(ValueError, match="opening"):
+        align_indoor_outdoor(indoor, outdoor)
+
+    # with fallback: recovers the single match and the correct transform
+    result = align_indoor_outdoor(indoor, outdoor, use_intrinsic_fallback=True)
+    assert len(result.matches) == 1
+    assert result.matches[0][:2] == (0, 0)
+    assert np.allclose(result.R, R_true, atol=1e-6)
+    assert np.allclose(result.t, t_true, atol=1e-6)
+
+
+def test_align_indoor_outdoor_intrinsic_fallback_rejects_wrong_aspect_ratio():
+    indoor = [_make_detection("door", np.array([0.0, 0.0, 1.0]), 0.9, 2.1)]
+    outdoor = [_make_detection("door", np.array([5.0, 5.0, 1.0]), 2.1, 0.9)]  # swapped w/h -> very different aspect
+
+    with pytest.raises(ValueError, match="opening"):
+        align_indoor_outdoor(indoor, outdoor, use_intrinsic_fallback=True)

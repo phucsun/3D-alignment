@@ -85,6 +85,11 @@ class PairWeights:
     roty_threshold: float = np.pi / 3
     rotz_threshold: float = np.pi / 3
 
+    # used only by the intrinsic-geometry fallback (see sgdu_distance's
+    # `use_intrinsic_fallback`) - max relative difference in width/height
+    # aspect ratio to still consider 2 isolated objects a candidate match
+    intrinsic_aspect_ratio_threshold: float = 0.5
+
     @property
     def angle_weights(self) -> np.ndarray:
         return np.array([self.alpha_weight, self.beta_weight, self.theta_weight])
@@ -255,7 +260,41 @@ def _assign_rectangular(cost: np.ndarray) -> tuple[float, int]:
     return total_cost / num_matched, num_matched
 
 
-def sgdu_distance(a: SGD, b: SGD, weights: PairWeights | None = None) -> tuple[float, int]:
+def _intrinsic_cost(a: Detection3D, b: Detection3D, weights: PairWeights) -> float:
+    """Cost between 2 detections using only each one's OWN absolute
+    geometric properties - no relation to other objects in the scene.
+
+    This is the only signal available when a scene has too few objects
+    for SGD's neighbor-relative descriptor to mean anything (an object
+    with 0 neighbors has an empty G^i, so `sgdu_distance` can never match
+    it to anything - confirmed on real data: an outdoor scan with only 1
+    detected door could never be matched to its indoor counterpart, even
+    though the door itself was detected correctly, simply because SGD had
+    no relational description to compare). Kabsch/Umeyama can already
+    recover a full 6(+1 scale)-DOF transform from a *single* correctly
+    identified match (a real door/window's 8 corners span 3 distinct
+    dimensions - width, height, thickness - so it isn't rotationally
+    symmetric); the missing piece was ever proposing that single match in
+    the first place.
+
+    Compares width/height aspect ratio (scale-invariant - indoor/outdoor
+    may not share a metric scale yet at matching time, see
+    `sgd.build_sgds`'s `normalize_distance`), not absolute size.
+    """
+    if a.category != b.category:
+        return INFEASIBLE
+    if a.height < 1e-9 or b.height < 1e-9:
+        return INFEASIBLE
+    aspect_a, aspect_b = a.width / a.height, b.width / b.height
+    relative_diff = abs(aspect_a - aspect_b) / max(aspect_a, aspect_b, 1e-9)
+    if relative_diff > weights.intrinsic_aspect_ratio_threshold:
+        return INFEASIBLE
+    return relative_diff
+
+
+def sgdu_distance(
+    a: SGD, b: SGD, weights: PairWeights | None = None, use_intrinsic_fallback: bool = False
+) -> tuple[float, int]:
     """Algorithm 2: the distance between two SGDUs.
 
     This is itself the cost of the best assignment between a's neighbor
@@ -263,11 +302,22 @@ def sgdu_distance(a: SGD, b: SGD, weights: PairWeights | None = None) -> tuple[f
     naive position-by-position comparison, since neither scene's object
     ordering means anything and the two objects may have different
     numbers of neighbors.
+
+    `use_intrinsic_fallback=False` (default) keeps the exact prior
+    behavior: an object with no neighbors (the only object detected in
+    its scene) can never be matched. Set `True` to fall back to
+    `_intrinsic_cost` specifically in that case - deliberately NOT used
+    when both objects merely fail the normal relational comparison
+    (wrong geometry is still wrong geometry; the fallback only kicks in
+    when the relational comparison had literally nothing to compare).
     """
     if a.detection.category != b.detection.category:
         return INFEASIBLE, 0
 
     weights = weights or PairWeights()
+    if use_intrinsic_fallback and (not a.neighbors or not b.neighbors):
+        return _intrinsic_cost(a.detection, b.detection, weights), 0
+
     cost = np.array([[_pair_feature_cost(fa, fb, weights) for fb in b.neighbors] for fa in a.neighbors])
     return _assign_rectangular(cost)
 
@@ -277,6 +327,7 @@ def match_sgds(
     outdoor_sgds: list[SGD],
     weights: PairWeights | None = None,
     max_cost: float = 5.0,
+    use_intrinsic_fallback: bool = False,
 ) -> list[tuple[int, int, float]]:
     """Algorithm 3 (matching phase): match indoor SGDUs to outdoor SGDUs.
 
@@ -285,12 +336,14 @@ def match_sgds(
     once more at this outer level. Returns (indoor_index, outdoor_index,
     cost) triples for accepted matches - pairs whose cost still exceeds
     `max_cost` after assignment are dropped (no real counterpart existed).
+
+    `use_intrinsic_fallback`: see `sgdu_distance`.
     """
     if not indoor_sgds or not outdoor_sgds:
         return []
     weights = weights or PairWeights()
 
-    cost = np.array([[sgdu_distance(a, b, weights)[0] for b in outdoor_sgds] for a in indoor_sgds])
+    cost = np.array([[sgdu_distance(a, b, weights, use_intrinsic_fallback)[0] for b in outdoor_sgds] for a in indoor_sgds])
 
     valid_rows = ~np.all(np.isinf(cost), axis=1)
     valid_cols = ~np.all(np.isinf(cost), axis=0)

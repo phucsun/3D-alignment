@@ -38,14 +38,21 @@ class MultiviewSource(Protocol):
 class ViewInstance:
     """One 2D-detected instance on one view: a category label + binary mask
     at that view's own image resolution (may differ from the depth map's
-    resolution - `build_detections_from_instances` resizes as needed)."""
+    resolution - `build_detections_from_instances` resizes as needed).
 
-    __slots__ = ("view_id", "label", "mask")
+    `conf`: the 2D detector's own confidence score (Grounding DINO/SAM2),
+    carried through so `backproject_instances(min_confidence=...)` can
+    drop weak detections before they ever reach the 3D measurement -
+    previously computed but silently discarded.
+    """
 
-    def __init__(self, view_id: int, label: str, mask: np.ndarray):
+    __slots__ = ("view_id", "label", "mask", "conf")
+
+    def __init__(self, view_id: int, label: str, mask: np.ndarray, conf: float = 1.0):
         self.view_id = view_id
         self.label = label
         self.mask = mask
+        self.conf = conf
 
 
 def merge_instances(
@@ -82,6 +89,7 @@ def backproject_instances(
     instances: list[ViewInstance],
     scale: float = 1.0,
     depth_range: tuple[float, float] = DEFAULT_DEPTH_RANGE,
+    min_confidence: float = 0.0,
 ) -> list[dict]:
     """Backproject every instance's 2D mask to a 3D world point cluster,
     using that instance's own view's depth map + pose. `scale` converts
@@ -91,9 +99,19 @@ def backproject_instances(
     against; see `sgd_alignment.matching.alignment.align_indoor_outdoor`'s
     `estimate_scale` for how matching now handles an unknown/inconsistent
     scale automatically instead, which is usually the better fix.
+
+    `min_confidence=0.0` (default) keeps every instance, unchanged from
+    before. Raise it to drop weak 2D detections (`inst.conf` below the
+    threshold) before they contribute any points to a merged cluster - a
+    single low-confidence, poorly-localized mask from one oblique/noisy
+    view can otherwise corrupt that opening's measured size regardless of
+    how many good views also saw it (see `points_to_detection`'s
+    `trim_percentile` for the complementary fix at the point-cluster level).
     """
     raw_instances = []
     for inst in instances:
+        if inst.conf < min_confidence:
+            continue
         depth = source.depth(inst.view_id)
         camera, pose = source.camera(inst.view_id), source.pose(inst.view_id)
         mask = inst.mask
@@ -108,7 +126,11 @@ def backproject_instances(
 
 
 def detections_from_clusters(
-    scene_points: np.ndarray, clusters: list[dict], is_outdoor: bool, up: np.ndarray | None = None
+    scene_points: np.ndarray,
+    clusters: list[dict],
+    is_outdoor: bool,
+    up: np.ndarray | None = None,
+    trim_percentile: float = 0.0,
 ) -> list[Detection3D]:
     """Measure each merged opening cluster against the scene's own wall
     planes (reusing exactly the same logic `manual_segmentation.py` uses
@@ -128,6 +150,8 @@ def detections_from_clusters(
     parallel when compared directly - not something to assume, only to
     verify per pair), passing the other scene's already-trustworthy `up`
     here sidesteps a bad estimate on a poorly-covered one.
+
+    `trim_percentile`: forwarded to `points_to_detection` - see there.
     """
     scene_pc = PointCloud(points=scene_points)
     up = up if up is not None else estimate_up_vector_manhattan(scene_pc)
@@ -137,7 +161,8 @@ def detections_from_clusters(
     detections = []
     for cluster in clusters:
         wall_normal = nearest_wall_normal(cluster["points"].mean(axis=0), walls, oriented_normals)
-        detections.append(points_to_detection(cluster["points"], cluster["label"], up, wall_normal))
+        detections.append(points_to_detection(cluster["points"], cluster["label"], up, wall_normal,
+                                                trim_percentile=trim_percentile))
     return detections
 
 
@@ -149,13 +174,17 @@ def build_detections_from_instances(
     merge_distance: float = 0.6,
     depth_range: tuple[float, float] = DEFAULT_DEPTH_RANGE,
     up: np.ndarray | None = None,
+    min_confidence: float = 0.0,
+    trim_percentile: float = 0.0,
 ) -> list[Detection3D]:
     """Full detection-side pipeline: backproject every 2D instance to 3D,
     merge duplicates seen from multiple views, then measure each merged
     opening (`detections_from_clusters`) to produce `Detection3D`s ready
-    for `sgd_alignment.matching`. See `detections_from_clusters` for `up`.
+    for `sgd_alignment.matching`. See `detections_from_clusters` for `up`/
+    `trim_percentile`, and `backproject_instances` for `min_confidence`.
     """
-    raw_instances = backproject_instances(source, instances, scale=scale, depth_range=depth_range)
+    raw_instances = backproject_instances(source, instances, scale=scale, depth_range=depth_range,
+                                           min_confidence=min_confidence)
     merged = merge_instances(raw_instances, merge_distance=merge_distance)
     scene_points, _ = source.build_scene_point_cloud()
-    return detections_from_clusters(scene_points * scale, merged, is_outdoor, up=up)
+    return detections_from_clusters(scene_points * scale, merged, is_outdoor, up=up, trim_percentile=trim_percentile)

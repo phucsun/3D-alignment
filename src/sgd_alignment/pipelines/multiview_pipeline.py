@@ -84,6 +84,8 @@ class MultiviewPipelineConfig:
     output_name: str = "indoor"
     segmenter: SegmenterConfig = field(default_factory=SegmenterConfig)
     up: list[float] | None = None  # override auto up-vector estimation - see detections_from_clusters
+    min_confidence: float = 0.0    # drop 2D detections below this conf before backprojecting - see backproject_instances
+    trim_percentile: float = 0.0   # robust width/height measurement - see opening_geometry.points_to_detection
 
 
 def load_pipeline_config(path: str | Path) -> MultiviewPipelineConfig:
@@ -178,12 +180,15 @@ def run_pipeline(config: MultiviewPipelineConfig, segmenter=None) -> list[Detect
         log.info("%s: %d object(s)", source.name(view_id), len(detected))
         for inst in detected:
             log.info("    %s: conf=%.2f", inst.label, inst.conf)
-            instances.append(ViewInstance(view_id=view_id, label=inst.label, mask=inst.mask))
+            instances.append(ViewInstance(view_id=view_id, label=inst.label, mask=inst.mask, conf=inst.conf))
 
     if not instances:
         raise ValueError("no door/window detected on any selected view - nothing to backproject")
 
-    raw_instances = backproject_instances(source, instances, scale=config.scale, depth_range=tuple(config.depth_range))
+    raw_instances = backproject_instances(source, instances, scale=config.scale, depth_range=tuple(config.depth_range),
+                                           min_confidence=config.min_confidence)
+    if config.min_confidence > 0:
+        log.info("min_confidence=%.2f: %d/%d instance(s) kept", config.min_confidence, len(raw_instances), len(instances))
     merged = merge_instances(raw_instances, merge_distance=config.merge_distance)
     log.info("%d raw instance(s) -> %d merged opening(s)", len(raw_instances), len(merged))
     scene_points, scene_colors = source.build_scene_point_cloud()
@@ -196,7 +201,8 @@ def run_pipeline(config: MultiviewPipelineConfig, segmenter=None) -> list[Detect
     else:
         up = estimate_up_vector_manhattan(PointCloud(points=scene_points))
         log.info("up vector (auto-estimated): %s", np.round(up, 4))
-    detections = detections_from_clusters(scene_points, merged, config.is_outdoor, up=up)
+    detections = detections_from_clusters(scene_points, merged, config.is_outdoor, up=up,
+                                           trim_percentile=config.trim_percentile)
 
     detections_path = output_dir / f"{config.output_name}_detections.pkl"
     with open(detections_path, "wb") as f:

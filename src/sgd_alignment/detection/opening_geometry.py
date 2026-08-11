@@ -70,12 +70,26 @@ def points_to_detection(
     category: str,
     up: np.ndarray,
     wall_normal: np.ndarray | None,
+    trim_percentile: float = 0.0,
 ) -> Detection3D:
     """Measure width/height of a raw 3D point cluster belonging to one
     opening, in a wall-aligned (u, v) frame, using the *actual detected
     wall's* normal (already reliably outward-oriented per-wall, see
     `orient_walls_outward`) rather than re-deriving orientation from this
     small cluster alone.
+
+    `trim_percentile=0.0` (default) measures the exact `min()`/`max()`
+    extent - unchanged from before (`np.percentile(x, 0)`/`(x, 100)` equal
+    `min()`/`max()` exactly, no interpolation at the boundary, so this is
+    a genuine no-op, not an approximation). Set e.g. `2.0` to instead use
+    the [2, 98] percentile range: `min()`/`max()` are the least robust
+    possible statistic (a *single* outlier point - a mis-segmented mask
+    edge pixel from one oblique/noisy view among several merged views -
+    directly sets the measured width or height). Only meaningful for the
+    multi-view photo pipeline, where multiple independently-noisy views
+    get merged into one cluster; CloudCompare hand selections don't need
+    it (a human already excluded stray points), so
+    `manual_segmentation.py` keeps the default.
     """
     centroid = points.mean(axis=0)
 
@@ -100,9 +114,11 @@ def points_to_detection(
     centered = onto_plane - centroid
     u = centered @ u_axis
     v = centered @ v_axis
-    width = float(u.max() - u.min())
-    height = float(v.max() - v.min())
-    center = centroid + ((u.max() + u.min()) / 2) * u_axis + ((v.max() + v.min()) / 2) * v_axis
+    u_lo, u_hi = np.percentile(u, [trim_percentile, 100 - trim_percentile])
+    v_lo, v_hi = np.percentile(v, [trim_percentile, 100 - trim_percentile])
+    width = float(u_hi - u_lo)
+    height = float(v_hi - v_lo)
+    center = centroid + ((u_hi + u_lo) / 2) * u_axis + ((v_hi + v_lo) / 2) * v_axis
 
     return Detection3D(
         category=category,

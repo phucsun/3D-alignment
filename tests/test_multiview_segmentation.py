@@ -3,6 +3,7 @@ from scipy.spatial.transform import Rotation
 
 from sgd_alignment.detection.multiview_segmentation import (
     ViewInstance,
+    backproject_instances,
     build_detections_from_instances,
     merge_instances,
 )
@@ -14,6 +15,7 @@ from sgd_alignment.detection.multiview_source import (
     backproject_mask_to_world,
     qvec2rotmat,
 )
+from sgd_alignment.detection.opening_geometry import points_to_detection
 
 
 def test_qvec2rotmat_matches_scipy_roundtrip():
@@ -186,3 +188,77 @@ def test_build_detections_from_instances_end_to_end_synthetic_scene():
     assert abs(d.height - 2.1) < 0.05
     assert np.allclose(d.center, [0.0, 0.0, 1.25], atol=0.05)
     assert abs(abs(np.dot(d.normal, [0.0, 1.0, 0.0])) - 1.0) < 1e-3
+
+
+def test_points_to_detection_trim_percentile_zero_matches_exact_minmax():
+    """trim_percentile=0.0 (default) must be byte-for-byte the old min/max
+    behavior - np.percentile at the 0/100 boundary returns the exact
+    min/max, no interpolation - so this is a genuine no-op, not just a
+    close approximation."""
+    rng = np.random.default_rng(0)
+    up = np.array([0.0, 0.0, 1.0])
+    normal = np.array([1.0, 0.0, 0.0])
+    points = rng.uniform(-1, 1, size=(200, 3))
+
+    d0 = points_to_detection(points, "window", up, normal, trim_percentile=0.0)
+    d_default = points_to_detection(points, "window", up, normal)
+    assert d0.width == d_default.width
+    assert d0.height == d_default.height
+    assert np.array_equal(d0.center, d_default.center)
+
+
+def test_points_to_detection_trim_percentile_rejects_outlier():
+    """A single stray point (e.g. a mis-segmented mask-edge pixel from one
+    noisy/oblique view among several merged views) must not be able to
+    single-handedly blow up the measured width/height once trimmed."""
+    up = np.array([0.0, 0.0, 1.0])
+    normal = np.array([1.0, 0.0, 0.0])
+
+    # a clean 1m x 2m rectangle on the y=0-ish plane (normal = x), sampled densely
+    rng = np.random.default_rng(1)
+    n = 500
+    u = rng.uniform(-0.5, 0.5, size=n)
+    v = rng.uniform(-1.0, 1.0, size=n)
+    clean_points = np.stack([np.zeros(n), u, v], axis=1)
+
+    outlier = np.array([[0.0, 8.0, 0.0]])  # one point 8m off to the side
+    points_with_outlier = np.concatenate([clean_points, outlier])
+
+    d_untrimmed = points_to_detection(points_with_outlier, "window", up, normal, trim_percentile=0.0)
+    assert d_untrimmed.width > 5.0  # corrupted by the single outlier, as expected
+
+    d_trimmed = points_to_detection(points_with_outlier, "window", up, normal, trim_percentile=1.0)
+    assert abs(d_trimmed.width - 1.0) < 0.1  # recovers close to the true 1m width
+    assert abs(d_trimmed.height - 2.0) < 0.1
+
+
+def test_backproject_instances_min_confidence_filters_weak_detections():
+    R = np.eye(3)
+    t = np.zeros(3)
+    camera = Camera(id=0, model="PINHOLE", width=10, height=10, params=np.array([10.0, 10.0, 5.0, 5.0]))
+    pose = Pose(id=0, R=R, t=t, name="v0")
+
+    class FakeSource:
+        view_ids = [0]
+
+        def camera(self, view_id):
+            return camera
+
+        def pose(self, view_id):
+            return pose
+
+        def depth(self, view_id):
+            return np.full((10, 10), 3.0, dtype=np.float32)
+
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[4:6, 4:6] = True
+    instances = [
+        ViewInstance(view_id=0, label="door", mask=mask, conf=0.9),
+        ViewInstance(view_id=0, label="door", mask=mask, conf=0.3),
+    ]
+
+    kept_all = backproject_instances(FakeSource(), instances, min_confidence=0.0)
+    assert len(kept_all) == 2
+
+    kept_strong = backproject_instances(FakeSource(), instances, min_confidence=0.5)
+    assert len(kept_strong) == 1
