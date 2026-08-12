@@ -48,7 +48,15 @@ _WEIGHT_FIELDS = [
 @dataclass
 class CalibrationExample:
     """One scene-pair with already-verified-correct correspondences to
-    calibrate/evaluate against."""
+    calibrate/evaluate against.
+
+    `visual_similarity`: optional {(indoor_idx, outdoor_idx): cosine_similarity}
+    from a visual-style embedding (e.g. CLIP) of each object's own image
+    crop - only populated for scenes where a real crop is actually
+    recoverable (see `clip_visual.py`; most of this project's datasets have
+    no source imagery at all, e.g. every CloudCompare/LiDAR scene, so this
+    is `None` for them by default and the visual term contributes nothing).
+    """
 
     name: str
     indoor: list[Detection3D]
@@ -56,6 +64,7 @@ class CalibrationExample:
     matches: list[tuple[int, int]]  # verified-correct (indoor_idx, outdoor_idx)
     normalize_distance: bool = False
     use_intrinsic_fallback: bool = False
+    visual_similarity: dict[tuple[int, int], float] | None = None
 
 
 def _weights_from_log_vector(x: np.ndarray, base: PairWeights) -> PairWeights:
@@ -192,3 +201,108 @@ def leave_one_scene_out_cv(
             }
         )
     return reports
+
+
+def _visual_cost(sim: float | None) -> float:
+    """1 - cosine similarity, or 0 (no opinion) if no crop was available for
+    this pair - a missing visual signal must never look like a *confirmed*
+    match, only like "this term has nothing to say here"."""
+    return 0.0 if sim is None else (1.0 - sim)
+
+
+def _combined_cost(
+    ex: CalibrationExample, i: int, j: int, weights: PairWeights, visual_weight: float,
+    indoor_sgds, outdoor_sgds,
+) -> float:
+    geo_cost, _ = sgdu_distance(indoor_sgds[i], outdoor_sgds[j], weights, ex.use_intrinsic_fallback)
+    if not np.isfinite(geo_cost):
+        return geo_cost
+    sim = ex.visual_similarity.get((i, j)) if ex.visual_similarity else None
+    return geo_cost + visual_weight * _visual_cost(sim)
+
+
+def margin_loss_with_visual(
+    weights: PairWeights,
+    visual_weight: float,
+    examples: list[CalibrationExample],
+    margin_target: float = 0.05,
+) -> float:
+    """Same hinge-loss margin objective as `margin_loss`, but cost =
+    geometric SGDU cost + `visual_weight` * (1 - CLIP cosine similarity) for
+    pairs that have a `visual_similarity` entry (0 contribution otherwise).
+    Isolates the effect of the visual term: pass a FIXED, already-trusted
+    `weights` (e.g. the hand-picked defaults) and calibrate only
+    `visual_weight` against scenes that actually carry visual data, instead
+    of re-fitting all 8 parameters on the same handful of examples.
+    """
+    total, count = 0.0, 0
+    for ex in examples:
+        indoor_sgds = build_sgds(ex.indoor, normalize_distance=ex.normalize_distance)
+        outdoor_sgds = build_sgds(ex.outdoor, normalize_distance=ex.normalize_distance)
+        for i, j in ex.matches:
+            cost_correct = _combined_cost(ex, i, j, weights, visual_weight, indoor_sgds, outdoor_sgds)
+            count += 1
+            if not np.isfinite(cost_correct):
+                total += 10.0
+                continue
+            neg_costs = [
+                _combined_cost(ex, i, k, weights, visual_weight, indoor_sgds, outdoor_sgds)
+                for k in range(len(ex.outdoor))
+                if k != j
+            ]
+            neg_costs = [c for c in neg_costs if np.isfinite(c)]
+            if neg_costs:
+                margin = min(neg_costs) - cost_correct
+                total += max(0.0, margin_target - margin)
+    return total / max(count, 1)
+
+
+def calibrate_visual_weight(
+    examples: list[CalibrationExample],
+    base_weights: PairWeights | None = None,
+    margin_target: float = 0.05,
+    init_visual_weight: float = 0.1,
+) -> float:
+    """Fit the single `visual_weight` scalar by the same margin-optimization
+    principle as `calibrate_weights`, keeping the geometric weights fixed at
+    `base_weights` - only examples with a populated `visual_similarity` can
+    influence the fit; scenes without visual data contribute 0 gradient
+    signal either way, so this never overfits geometric-only scenes to a
+    parameter they have no opinion on.
+    """
+    base = base_weights or PairWeights()
+    result = minimize(
+        lambda x: margin_loss_with_visual(base, float(np.exp(x[0])), examples, margin_target),
+        np.array([np.log(init_visual_weight)]),
+        method="Nelder-Mead",
+        options={"xatol": 1e-4, "fatol": 1e-6, "maxiter": 500, "maxfev": 500},
+    )
+    return float(np.exp(result.x[0]))
+
+
+def mean_margin_ratio_with_visual(
+    weights: PairWeights, visual_weight: float, examples: list[CalibrationExample]
+) -> float:
+    """`mean_margin_ratio`'s evaluation metric, computed on the combined
+    (geometric + visual) cost instead of geometric cost alone."""
+    ratios = []
+    for ex in examples:
+        indoor_sgds = build_sgds(ex.indoor, normalize_distance=ex.normalize_distance)
+        outdoor_sgds = build_sgds(ex.outdoor, normalize_distance=ex.normalize_distance)
+        for i, j in ex.matches:
+            cost_correct = _combined_cost(ex, i, j, weights, visual_weight, indoor_sgds, outdoor_sgds)
+            if not np.isfinite(cost_correct):
+                ratios.append(float("inf"))
+                continue
+            neg_costs = [
+                _combined_cost(ex, i, k, weights, visual_weight, indoor_sgds, outdoor_sgds)
+                for k in range(len(ex.outdoor))
+                if k != j
+            ]
+            neg_costs = [c for c in neg_costs if np.isfinite(c)]
+            if not neg_costs:
+                continue
+            next_best = min(neg_costs)
+            ratios.append(0.0 if next_best <= 1e-12 else cost_correct / next_best)
+    finite = [r for r in ratios if np.isfinite(r)]
+    return float(np.mean(finite)) if finite else float("nan")
