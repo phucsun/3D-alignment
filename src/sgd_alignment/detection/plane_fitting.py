@@ -100,6 +100,37 @@ def estimate_up_vector(
     return up / np.linalg.norm(up)
 
 
+def _candidate_up_axes(
+    pc: PointCloud,
+    distance_threshold: float,
+    min_inliers: int,
+    num_probe_planes: int,
+    ransac_n: int,
+    num_iterations: int,
+    same_axis_dot: float,
+) -> list[tuple[np.ndarray, float]]:
+    """The full ranked candidate list `estimate_up_vector_manhattan` picks
+    its top choice from - (unit axis, whole-point-cloud extent along it),
+    sorted smallest-extent-first. Split out so a caller with a second,
+    independent scene of the same building can cross-check candidates
+    against each other instead of trusting either scene's lone top pick -
+    see `estimate_up_vector_cross_scene`.
+    """
+    planes = _extract_planes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations)
+    if not planes:
+        return [(np.array([0.0, 0.0, 1.0]), float("inf"))]
+
+    planes_sorted = sorted(planes, key=lambda p: -len(p.inlier_indices))
+    axes: list[np.ndarray] = []
+    for p in planes_sorted:
+        if not any(abs(float(np.dot(p.normal, axis))) >= same_axis_dot for axis in axes):
+            axes.append(p.normal)
+
+    extents = [(pc.points @ axis).max() - (pc.points @ axis).min() for axis in axes]
+    candidates = sorted(zip(axes, extents), key=lambda pair: pair[1])
+    return [(axis / np.linalg.norm(axis), extent) for axis, extent in candidates]
+
+
 def estimate_up_vector_manhattan(
     pc: PointCloud,
     distance_threshold: float = 0.03,
@@ -133,21 +164,84 @@ def estimate_up_vector_manhattan(
     axis carry more RANSAC inlier points than its floor/ceiling axis,
     silently picking the wrong axis as "up"). Spatial extent doesn't have
     that failure mode.
+
+    Residual failure mode this still doesn't cover (confirmed on real
+    data multiple times): a genuinely narrow/elongated space (a corridor
+    only 1.5m wide but 2.4m to the ceiling) violates the "shorter than
+    wide" assumption outright, however well it's captured - no
+    single-scene geometric heuristic can fix this, since the data itself
+    doesn't disambiguate. See `estimate_up_vector_cross_scene`, which
+    sidesteps it using the second scene this project always has anyway.
     """
-    planes = _extract_planes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations)
-    if not planes:
-        return np.array([0.0, 0.0, 1.0])
+    return _candidate_up_axes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations,
+                               same_axis_dot)[0][0]
 
-    planes_sorted = sorted(planes, key=lambda p: -len(p.inlier_indices))
-    axes: list[np.ndarray] = []
 
-    for p in planes_sorted:
-        if not any(abs(float(np.dot(p.normal, axis))) >= same_axis_dot for axis in axes):
-            axes.append(p.normal)
+def estimate_up_vector_cross_scene(
+    pc_a: PointCloud,
+    pc_b: PointCloud,
+    distance_threshold: float = 0.03,
+    min_inliers: int = 2000,
+    num_probe_planes: int = 15,
+    ransac_n: int = 3,
+    num_iterations: int = 1000,
+    same_axis_dot: float = 0.9,
+    min_agreement_dot: float = 0.85,
+) -> tuple[np.ndarray, float]:
+    """Resolve `estimate_up_vector_manhattan`'s residual failure mode
+    (narrow/elongated spaces, where no single scene has enough geometric
+    diversity to tell true vertical from a wall) by using the OTHER scene
+    this project always has anyway - the two scans of the same building
+    should share one real "up", so cross-checking both scenes' full
+    candidate lists (not just each one's own top pick) against each other
+    finds the one pair that mutually confirms itself, without needing a
+    metric scale or extra equipment (IMU etc).
 
-    extents = [(pc.points @ axis).max() - (pc.points @ axis).min() for axis in axes]
-    best_axis = axes[int(np.argmin(extents))]
-    return best_axis / np.linalg.norm(best_axis)
+    Manually verified to work repeatedly on real data before being
+    automated here: e.g. two independent DA3 reconstructions of the same
+    building gave up-vector top-picks agreeing at dot=0.999 in one case
+    (confirming both scenes independently converged on the true vertical)
+    and as low as dot=0.80 in another (where neither scene's own top pick
+    was reliable alone, but checking down each scene's full candidate
+    list found a pair - not necessarily each side's #1 choice - agreeing
+    far better than any other combination).
+
+    Raises `ValueError` if even the best cross-scene pair doesn't agree
+    above `min_agreement_dot` - deliberately does NOT fall back to
+    guessing, since a low best-agreement means neither scene's data
+    disambiguates "up" at all (e.g. two corridors with no floor/ceiling
+    coverage on either side - a real limitation no amount of algorithmic
+    cleverness recovers from, only recapturing with more coverage does).
+
+    Returns `(up, agreement)`: one shared unit vector for BOTH scenes to
+    use (average of the winning pair, not just one scene's own guess -
+    each individual scene's fit carries its own noise) and the winning
+    pair's dot product, as a confidence score to log/report.
+    """
+    candidates_a = _candidate_up_axes(pc_a, distance_threshold, min_inliers, num_probe_planes, ransac_n,
+                                       num_iterations, same_axis_dot)
+    candidates_b = _candidate_up_axes(pc_b, distance_threshold, min_inliers, num_probe_planes, ransac_n,
+                                       num_iterations, same_axis_dot)
+
+    best_dot, best_a, best_b = -1.0, candidates_a[0][0], candidates_b[0][0]
+    for axis_a, _ in candidates_a:
+        for axis_b, _ in candidates_b:
+            dot = abs(float(np.dot(axis_a, axis_b)))
+            if dot > best_dot:
+                best_dot, best_a, best_b = dot, axis_a, axis_b
+
+    if best_dot < min_agreement_dot:
+        raise ValueError(
+            f"no consistent up-vector found between the 2 scenes (best cross-scene agreement "
+            f"{best_dot:.3f} < {min_agreement_dot}) - neither scene's geometry disambiguates "
+            "'up' reliably on its own or against the other; provide `up` manually or recapture "
+            "with more floor/ceiling coverage on at least one side"
+        )
+
+    if np.dot(best_a, best_b) < 0:
+        best_b = -best_b
+    up = best_a + best_b
+    return up / np.linalg.norm(up), best_dot
 
 
 def estimate_up_vector_from_local_normals(

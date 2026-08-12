@@ -1,0 +1,14 @@
+source:
+  backend: da3
+  npz_path: data/home/video2_v2/results.npz
+selected_views: []
+is_outdoor: true
+scale: 1.0
+merge_distance: 0.6
+depth_range: [0.05, 30.0]
+output_dir: outputs/door_only
+output_name: home_outdoor
+segmenter:
+  text_prompt: "door."
+  box_threshold: 0.5
+  text_threshold: 0.25

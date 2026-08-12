@@ -109,14 +109,29 @@ def _reassign_by_geometric_residual(
     R: np.ndarray,
     t: np.ndarray,
     max_residual: float | None,
+    normal_angle_threshold: float | None = None,
 ) -> list[tuple[int, int, float]]:
     """One Hungarian re-assignment of ALL (same-category) indoor/outdoor
     pairs by center-to-center distance *after* applying (R, t) - the
-    geometric-consensus half of `refine_matches_with_geometric_consensus`.
+    geometric-consensus half of `refine_matches_with_geometric_consensus`
+    and `ransac_match_with_wall_consensus`.
+
+    `normal_angle_threshold`: additionally reject a pair whose wall
+    normals aren't consistent under (R, t) (radians). Only meaningful
+    when (R, t) itself comes from a trustworthy hypothesis - see
+    `ransac_match_with_wall_consensus`'s docstring for why bootstrapping
+    this from an unverified full match set (as an earlier version of this
+    project's refinement did) is unsound and was reverted.
     """
     n_i, n_o = len(indoor_detections), len(outdoor_detections)
     cost = np.full((n_i, n_o), INFEASIBLE)
     transformed = transform_points(np.array([d.center for d in indoor_detections]), R, t)
+
+    transformed_normals = None
+    if normal_angle_threshold is not None:
+        raw = np.array([d.normal for d in indoor_detections]) @ R.T
+        transformed_normals = raw / np.linalg.norm(raw, axis=1, keepdims=True)
+
     for i, di in enumerate(indoor_detections):
         for j, dj in enumerate(outdoor_detections):
             if di.category != dj.category:
@@ -124,6 +139,10 @@ def _reassign_by_geometric_residual(
             residual = float(np.linalg.norm(transformed[i] - dj.center))
             if max_residual is not None and residual > max_residual:
                 continue
+            if transformed_normals is not None:
+                cos_angle = np.clip(np.dot(transformed_normals[i], dj.normal), -1.0, 1.0)
+                if np.arccos(cos_angle) > normal_angle_threshold:
+                    continue
             cost[i, j] = residual
 
     valid_rows = ~np.all(np.isinf(cost), axis=1)
@@ -194,6 +213,112 @@ def refine_matches_with_geometric_consensus(
     return current, R, t
 
 
+def _filter_degenerate(detections: list[Detection3D], min_dimension: float) -> tuple[list[Detection3D], list[int]]:
+    """Drop detections whose width or height is physically implausible
+    for ANY door/window (not a per-category "typical size" prior, which
+    can't generalize across building types/regions - just a sanity floor
+    against outright broken measurements). Confirmed on real data: a
+    "door" detection 0.03m wide (clearly a segmentation/backprojection
+    artifact, not a real opening) produced a deceptively good-looking fit
+    to an unrelated match purely because a near-degenerate box's corners
+    barely constrain anything - `refine_matches_with_geometric_consensus`
+    even "confirmed" it via low residual. Returns `(kept_detections,
+    original_indices)` so callers can map filtered-list positions back to
+    indices into the original list.
+    """
+    kept = [(i, d) for i, d in enumerate(detections) if d.width >= min_dimension and d.height >= min_dimension]
+    return [d for _, d in kept], [i for i, _ in kept]
+
+
+def ransac_match_with_wall_consensus(
+    indoor_detections: list[Detection3D],
+    outdoor_detections: list[Detection3D],
+    matches: list[tuple[int, int, float]],
+    estimate_scale: bool = False,
+    max_residual: float | None = None,
+    normal_angle_threshold: float = np.pi / 6,
+    min_sample_size: int = 2,
+    max_hypotheses: int = 500,
+    rng_seed: int = 0,
+) -> tuple[list[tuple[int, int, float]], np.ndarray | None, np.ndarray | None]:
+    """Proper hypothesize-and-verify RANSAC on top of the SGD matches,
+    checking BOTH position and wall-orientation consensus - the intended
+    fix for a real failure mode `refine_matches_with_geometric_consensus`
+    cannot handle: several openings genuinely belong to unrelated walls
+    (confirmed on real data - a meeting room with 1-2 doors facing a
+    shared corridor, plus several other doors/windows facing entirely
+    different spaces, on both sides).
+
+    Deliberately NOT built by adding a wall-orientation check into that
+    existing iterative refiner: that refiner *fits its hypothesis from
+    the very matches it's trying to verify* (dominated by whichever
+    matches happened to be in the initial SGD result, right or wrong),
+    then checks new candidates against that self-derived hypothesis - a
+    genuinely wrong initial batch produces a genuinely wrong hypothesis,
+    which then "confirms" itself. Tried exactly this on real data: it
+    picked a 0.03m-wide degenerate "door" detection as part of the
+    accepted result, because a near-degenerate box's corners barely
+    constrain anything and happened to fit the (already wrong) hypothesis
+    - low residual, high confidence, completely incorrect. Confirmed
+    wrong by visual inspection of the exported aligned model; reverted.
+
+    This version fits each hypothesis from a small (`min_sample_size`,
+    default 2) sample drawn from `matches`, checks how many OTHER pairs
+    - across ALL same-category indoor/outdoor combinations, not just the
+    ones already in `matches` - agree with it on both position and wall
+    normal, and keeps whichever hypothesis wins the most agreement
+    (standard RANSAC consensus scoring, like PnP-RANSAC in SfM). A
+    hypothesis seeded from 2 bad matches simply won't attract much
+    agreement from the rest of the data and loses to a better one; no
+    single detection (however degenerate) can single-handedly bootstrap
+    its own confirmation the way the iterative version could.
+
+    Tries every `min_sample_size`-combination of `matches` if there are
+    few enough (`max_hypotheses`), otherwise samples that many at random.
+    Returns `(matches, None, None)` unchanged if there are too few
+    matches to draw even one sample, or if no hypothesis attracted any
+    consensus at all (rather than guessing).
+    """
+    if len(matches) < min_sample_size:
+        return matches, None, None
+
+    from itertools import combinations
+
+    all_samples = list(combinations(range(len(matches)), min_sample_size))
+    if len(all_samples) > max_hypotheses:
+        rng = np.random.default_rng(rng_seed)
+        chosen = rng.choice(len(all_samples), size=max_hypotheses, replace=False)
+        all_samples = [all_samples[i] for i in chosen]
+
+    best_inliers: list[tuple[int, int, float]] = []
+    best_R, best_t = None, None
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")  # a degenerate minimal sample just scores poorly, no need to warn per-hypothesis
+        for sample_idx in all_samples:
+            sample = [matches[k] for k in sample_idx]
+            src = np.concatenate([indoor_detections[i].corners() for i, _, _ in sample])
+            dst = np.concatenate([outdoor_detections[j].corners() for _, j, _ in sample])
+            try:
+                R, t = estimate_rigid_transform(src, dst, estimate_scale=estimate_scale)
+            except ValueError:
+                continue
+            inliers = _reassign_by_geometric_residual(
+                indoor_detections, outdoor_detections, R, t, max_residual, normal_angle_threshold,
+            )
+            if len(inliers) > len(best_inliers):
+                best_inliers, best_R, best_t = inliers, R, t
+
+    if not best_inliers:
+        return matches, None, None
+
+    # final polish: refit (R, t) from the *entire* winning consensus set,
+    # not just its 2-match seed
+    src = np.concatenate([indoor_detections[i].corners() for i, _, _ in best_inliers])
+    dst = np.concatenate([outdoor_detections[j].corners() for _, j, _ in best_inliers])
+    R, t = estimate_rigid_transform(src, dst, estimate_scale=estimate_scale)
+    return best_inliers, R, t
+
+
 @dataclass
 class AlignmentResult:
     R: np.ndarray  # (3,3) rotation (or scale * rotation if estimate_scale=True)
@@ -213,6 +338,12 @@ def align_indoor_outdoor(
     refine_with_geometric_consensus: bool = False,
     refine_max_residual: float | None = None,
     use_intrinsic_fallback: bool = False,
+    use_ambiguity_check: bool = False,
+    ambiguity_ratio_threshold: float = 0.8,
+    min_dimension: float | None = None,
+    use_ransac_consensus: bool = False,
+    ransac_normal_angle_threshold: float = np.pi / 6,
+    ransac_max_residual: float | None = None,
 ) -> AlignmentResult:
     """Match openings between an indoor and outdoor scan, then compute the
     rigid transform (indoor -> outdoor frame) from all 8 corners of each
@@ -243,11 +374,42 @@ def align_indoor_outdoor(
     descriptor to mean anything - see `sgd._intrinsic_cost`. Needed for
     scenes with only 1-2 detected openings, which otherwise can never be
     matched at all regardless of how correct the detection is.
+
+    `use_ambiguity_check`/`ambiguity_ratio_threshold`: see
+    `sgd.match_sgds`/`sgd._ambiguity_ratio` - rejects matches that aren't
+    decisively better than the next-best alternative, guarding against
+    unrelated same-category "distractor" objects on one side (e.g. extra
+    fire-exit doors in a corridor with no indoor counterpart).
+
+    `min_dimension` (`None` = off): drop any detection whose width or
+    height falls below this (meters, or scene units) before matching -
+    see `_filter_degenerate`. Matched indices in the returned result
+    always refer to the original `indoor_detections`/`outdoor_detections`
+    lists passed in, regardless of filtering.
+
+    `use_ransac_consensus=False` by default. Turn on to run
+    `ransac_match_with_wall_consensus` after SGD matching (and after
+    `refine_with_geometric_consensus`, if both are on) - the properly
+    hypothesize-and-verify version of consensus checking (small seed
+    samples + position AND wall-orientation agreement), the intended fix
+    for openings that genuinely belong to unrelated walls; see that
+    function's docstring for why it's a separate function rather than an
+    extension of `refine_with_geometric_consensus`.
     """
-    indoor_sgds: list[SGD] = build_sgds(indoor_detections, normalize_distance=normalize_distance)
-    outdoor_sgds: list[SGD] = build_sgds(outdoor_detections, normalize_distance=normalize_distance)
+    if min_dimension is not None:
+        indoor_filtered, indoor_index_map = _filter_degenerate(indoor_detections, min_dimension)
+        outdoor_filtered, outdoor_index_map = _filter_degenerate(outdoor_detections, min_dimension)
+    else:
+        indoor_filtered, indoor_index_map = indoor_detections, list(range(len(indoor_detections)))
+        outdoor_filtered, outdoor_index_map = outdoor_detections, list(range(len(outdoor_detections)))
+
+    indoor_sgds: list[SGD] = build_sgds(indoor_filtered, normalize_distance=normalize_distance)
+    outdoor_sgds: list[SGD] = build_sgds(outdoor_filtered, normalize_distance=normalize_distance)
     matches = match_sgds(indoor_sgds, outdoor_sgds, weights=weights, max_cost=max_cost,
-                          use_intrinsic_fallback=use_intrinsic_fallback)
+                          use_intrinsic_fallback=use_intrinsic_fallback,
+                          use_ambiguity_check=use_ambiguity_check,
+                          ambiguity_ratio_threshold=ambiguity_ratio_threshold)
+    matches = [(indoor_index_map[i], outdoor_index_map[j], c) for i, j, c in matches]
 
     if len(matches) < 1:
         raise ValueError(
@@ -262,6 +424,15 @@ def align_indoor_outdoor(
         )
         if len(matches) < 1:
             raise ValueError("geometric consensus refinement left 0 matches - detection quality likely too poor")
+
+    if use_ransac_consensus:
+        matches, _, _ = ransac_match_with_wall_consensus(
+            indoor_detections, outdoor_detections, matches,
+            estimate_scale=estimate_scale, max_residual=ransac_max_residual,
+            normal_angle_threshold=ransac_normal_angle_threshold,
+        )
+        if len(matches) < 1:
+            raise ValueError("RANSAC wall-consensus left 0 matches - detection quality likely too poor")
 
     src = np.concatenate([indoor_detections[i].corners() for i, _, _ in matches])
     dst = np.concatenate([outdoor_detections[j].corners() for _, j, _ in matches])

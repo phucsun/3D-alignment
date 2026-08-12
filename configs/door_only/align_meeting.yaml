@@ -1,0 +1,9 @@
+indoor_detections: outputs/door_only/meeting_indoor_detections.pkl
+indoor_scene_ply: outputs/door_only/meeting_indoor_scene.ply
+outdoor_detections: outputs/door_only/meeting_outdoor_detections.pkl
+outdoor_scene_ply: outputs/door_only/meeting_outdoor_scene.ply
+output_dir: outputs/door_only
+output_name: meeting_aligned
+estimate_scale: true
+normalize_distance: true
+max_cost: 5.0

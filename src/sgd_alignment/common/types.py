@@ -79,6 +79,7 @@ class Detection3D:
     width: float  # extent along u_axis
     height: float  # extent along v_axis
     thickness: float = 0.05  # nominal extent along normal, for a thin 3D box
+    region: str | None = None  # which space this belongs to (indoor) / connects to (outdoor) - see sgd.py
 
     def __post_init__(self) -> None:
         self.center = np.asarray(self.center, dtype=np.float64)

@@ -260,6 +260,29 @@ def _assign_rectangular(cost: np.ndarray) -> tuple[float, int]:
     return total_cost / num_matched, num_matched
 
 
+def _regions_compatible(a: Detection3D, b: Detection3D) -> bool:
+    """`Detection3D.region` is `None` unless explicitly labeled - compatible
+    by default (exact prior behavior, no region information available).
+    When BOTH sides carry a label, they must match exactly.
+
+    This is a hard, human-provided constraint, not a geometric heuristic:
+    it exists for cases no amount of geometry or imagery can resolve on
+    its own - e.g. two architecturally symmetric corridors on opposite
+    sides of a building, where a matched pair scores identically well
+    under either physical assignment (confirmed: neither RANSAC consensus
+    nor a richer descriptor can break a *genuine* symmetry, since the
+    ambiguous configurations are, by construction, indistinguishable from
+    the sensor data alone). Whoever captured the data already knows which
+    physical space is which; `region` just lets that knowledge into the
+    matching cost instead of asking the algorithm to reverse-engineer it.
+    Labeling every detection in a scene with the same region id (e.g. its
+    room name) is also the natural building block for matching MORE than
+    2 spaces at once in the future (a labeled graph of regions instead of
+    a single indoor/outdoor pair), not just a tie-breaker for this case.
+    """
+    return a.region is None or b.region is None or a.region == b.region
+
+
 def _intrinsic_cost(a: Detection3D, b: Detection3D, weights: PairWeights) -> float:
     """Cost between 2 detections using only each one's OWN absolute
     geometric properties - no relation to other objects in the scene.
@@ -281,7 +304,7 @@ def _intrinsic_cost(a: Detection3D, b: Detection3D, weights: PairWeights) -> flo
     may not share a metric scale yet at matching time, see
     `sgd.build_sgds`'s `normalize_distance`), not absolute size.
     """
-    if a.category != b.category:
+    if a.category != b.category or not _regions_compatible(a, b):
         return INFEASIBLE
     if a.height < 1e-9 or b.height < 1e-9:
         return INFEASIBLE
@@ -311,7 +334,7 @@ def sgdu_distance(
     (wrong geometry is still wrong geometry; the fallback only kicks in
     when the relational comparison had literally nothing to compare).
     """
-    if a.detection.category != b.detection.category:
+    if a.detection.category != b.detection.category or not _regions_compatible(a.detection, b.detection):
         return INFEASIBLE, 0
 
     weights = weights or PairWeights()
@@ -322,12 +345,33 @@ def sgdu_distance(
     return _assign_rectangular(cost)
 
 
+def _ambiguity_ratio(costs: np.ndarray, chosen_idx: int) -> float | None:
+    """Lowe's-ratio-test-style ambiguity check: how much better is the
+    chosen (Hungarian-optimal) cost than the best *alternative* in the
+    same row/column? Returns `chosen / next_best` (near 0 = clearly
+    distinctive, near 1 = another candidate was almost as good), or
+    `None` if there's no finite alternative to compare against (nothing
+    to be ambiguous with).
+    """
+    others = np.delete(costs, chosen_idx)
+    others = others[np.isfinite(others)]
+    if len(others) == 0:
+        return None
+    next_best = float(others.min())
+    chosen = float(costs[chosen_idx])
+    if next_best <= 1e-12:
+        return 0.0 if chosen <= 1e-12 else float("inf")
+    return chosen / next_best
+
+
 def match_sgds(
     indoor_sgds: list[SGD],
     outdoor_sgds: list[SGD],
     weights: PairWeights | None = None,
     max_cost: float = 5.0,
     use_intrinsic_fallback: bool = False,
+    use_ambiguity_check: bool = False,
+    ambiguity_ratio_threshold: float = 0.8,
 ) -> list[tuple[int, int, float]]:
     """Algorithm 3 (matching phase): match indoor SGDUs to outdoor SGDUs.
 
@@ -338,6 +382,24 @@ def match_sgds(
     `max_cost` after assignment are dropped (no real counterpart existed).
 
     `use_intrinsic_fallback`: see `sgdu_distance`.
+
+    `use_ambiguity_check=False` by default (exact prior behavior): the
+    Hungarian-optimal pair is always accepted regardless of how close the
+    *next-best* alternative was. Real risk this misses: a scene can
+    contain several same-category objects that have no true counterpart
+    at all (confirmed on real data - a corridor scan detected 5 doors,
+    only 1 physically corresponding to anything indoors, the other 4
+    unrelated fire-exit/utility doors); if one of those distractors
+    happens to have a similarly-good relational fit by coincidence,
+    nothing currently flags that the "best" match wasn't clearly better
+    than a wrong one. Set `True` to reject (not just accept-the-best) any
+    match whose cost isn't decisively lower than the next-best
+    alternative *on either side* (row and column) - the same principle as
+    Lowe's ratio test for SIFT feature matching. Trades some recall
+    (a few correct-but-genuinely-ambiguous matches get dropped too) for
+    precision (fewer coincidental false accepts) - see
+    `refine_matches_with_geometric_consensus` in `alignment.py` for a
+    complementary, non-mutually-exclusive fix.
     """
     if not indoor_sgds or not outdoor_sgds:
         return []
@@ -360,5 +422,11 @@ def match_sgds(
     for r, c in zip(row_idx, col_idx):
         if np.isinf(sub[r, c]) or sub[r, c] > max_cost:
             continue
+        if use_ambiguity_check:
+            row_ratio = _ambiguity_ratio(sub[r, :], c)
+            col_ratio = _ambiguity_ratio(sub[:, c], r)
+            if (row_ratio is not None and row_ratio > ambiguity_ratio_threshold) or \
+               (col_ratio is not None and col_ratio > ambiguity_ratio_threshold):
+                continue
         matches.append((int(row_ids[r]), int(col_ids[c]), float(sub[r, c])))
     return matches
