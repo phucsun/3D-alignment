@@ -16,23 +16,86 @@ from sgd_alignment.common.types import Plane, PointCloud
 DEFAULT_RANSAC_SEED = 0
 
 
+def _fit_plane_from_sample(sample: np.ndarray) -> np.ndarray | None:
+    """Fit a plane normal+offset through >=3 points. Returns None if the
+    sample is degenerate (collinear / coincident), so the caller can skip it.
+    """
+    if len(sample) == 3:
+        normal = np.cross(sample[1] - sample[0], sample[2] - sample[0])
+    else:
+        centroid = sample.mean(axis=0)
+        _, _, vt = np.linalg.svd(sample - centroid, full_matrices=False)
+        normal = vt[-1]
+    norm = np.linalg.norm(normal)
+    if norm < 1e-12:
+        return None
+    normal = normal / norm
+    d = -float(np.dot(normal, sample[0]))
+    return np.array([normal[0], normal[1], normal[2], d])
+
+
 def _segment_plane_ransac(
     points: np.ndarray,
     distance_threshold: float,
     ransac_n: int,
     num_iterations: int,
+    seed: int = DEFAULT_RANSAC_SEED,
 ) -> tuple[np.ndarray, np.ndarray]:
-    # open3d's RANSAC has no per-call seed argument; it draws from a global
-    # RNG, so pin it before every call for reproducible wall extraction.
-    o3d.utility.random.seed(DEFAULT_RANSAC_SEED)
-    o3d_pc = o3d.geometry.PointCloud()
-    o3d_pc.points = o3d.utility.Vector3dVector(points)
-    plane_model, inliers = o3d_pc.segment_plane(
-        distance_threshold=distance_threshold,
-        ransac_n=ransac_n,
-        num_iterations=num_iterations,
-    )
-    return np.asarray(plane_model, dtype=np.float64), np.asarray(inliers, dtype=np.int64)
+    """Self-contained RANSAC plane fit (minimal-sample hypothesize-and-verify,
+    same scheme as Open3D's `segment_plane`, refit by least-squares over the
+    winning inlier set at the end).
+
+    Reimplemented in plain numpy with a locally-seeded `Generator` instead of
+    calling Open3D's `segment_plane`: that function draws from Open3D's
+    process-global RNG and internally parallelizes trials across threads, so
+    re-seeding it before every call (as the previous version did) was NOT
+    enough for reproducibility - confirmed on real data, the same point cloud
+    fed through the exact same code twice returned different candidate planes
+    across separate process runs (thread-scheduling-dependent tie-breaking
+    among near-equal candidate planes). A local `np.random.default_rng(seed)`
+    with single-threaded numpy trials removes that dependency entirely.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(points)
+    if n < ransac_n:
+        return np.array([0.0, 0.0, 1.0, 0.0]), np.array([], dtype=np.int64)
+
+    # fit all candidate models up front (cheap: tiny per-sample fits), then
+    # score them against the full point cloud in model-batches via matrix
+    # multiplication (BLAS) instead of one numpy call per iteration - same
+    # result as a plain per-iteration loop, just far less call overhead for
+    # the large point clouds this project works with (10^5-10^6 points).
+    models = []
+    for _ in range(num_iterations):
+        sample_idx = rng.choice(n, size=ransac_n, replace=False)
+        model = _fit_plane_from_sample(points[sample_idx])
+        if model is not None:
+            models.append(model)
+
+    if not models:
+        return np.array([0.0, 0.0, 1.0, 0.0]), np.array([], dtype=np.int64)
+
+    models_arr = np.array(models)  # (K, 4)
+    best_count, best_row = -1, 0
+    chunk = max(1, min(len(models_arr), int(2e7 // max(n, 1))))
+    for start in range(0, len(models_arr), chunk):
+        batch = models_arr[start:start + chunk]
+        distances = np.abs(points @ batch[:, :3].T + batch[:, 3])  # (n, batch)
+        counts = np.count_nonzero(distances <= distance_threshold, axis=0)
+        row = int(np.argmax(counts))
+        if counts[row] > best_count:
+            best_count, best_row = int(counts[row]), start + row
+
+    best_model = models_arr[best_row]
+    best_inliers = np.nonzero(np.abs(points @ best_model[:3] + best_model[3]) <= distance_threshold)[0]
+
+    if len(best_inliers) < ransac_n:
+        return np.array([0.0, 0.0, 1.0, 0.0]), np.array([], dtype=np.int64)
+
+    # least-squares refit over the full winning inlier set, not just the
+    # minimal sample that found it (matches Open3D's own refinement step)
+    refit = _fit_plane_from_sample(points[best_inliers])
+    return (refit if refit is not None else best_model), best_inliers
 
 
 def _extract_planes(
