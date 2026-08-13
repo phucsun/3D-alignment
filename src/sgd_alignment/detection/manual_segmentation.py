@@ -26,18 +26,25 @@ from sgd_alignment.detection.plane_fitting import estimate_up_vector_manhattan, 
 WORLD_UP = np.array([0.0, 0.0, 1.0])
 DOOR_FIELD_PREFIX = "scalar_cua_ra_vao"
 WINDOW_FIELD_PREFIX = "scalar_cua_so"
+GENERIC_DOOR_FIELD_PREFIX = "scalar_cua"  # bare "cua_1"/"Cua_2" naming, no "_ra_vao"/"_so" qualifier
 
 
 def _field_category(field_name: str) -> str | None:
     # CloudCompare exports sometimes have a stray "-" instead of "_" in the
     # door field name (e.g. "scalar_cua_ra-vao_2") depending on how the
     # scalar field was typed/renamed by hand - normalize before matching
-    # the prefix so one typo doesn't silently drop a whole opening.
-    normalized = field_name.replace("-", "_")
-    if normalized.startswith(DOOR_FIELD_PREFIX):
-        return "door"
+    # the prefix so one typo doesn't silently drop a whole opening. Also
+    # lowercase first: some exports capitalize the field ("scalar_Cua_1"),
+    # and the naming convention itself isn't consistent across data
+    # collectors - some just write "cua_1"/"cua_2" (bare "door", no
+    # "_ra_vao"/"_so" qualifier) instead of the fuller original convention.
+    normalized = field_name.replace("-", "_").lower()
     if normalized.startswith(WINDOW_FIELD_PREFIX):
         return "window"
+    if normalized.startswith(DOOR_FIELD_PREFIX):
+        return "door"
+    if normalized.startswith(GENERIC_DOOR_FIELD_PREFIX):
+        return "door"
     return None
 
 

@@ -413,7 +413,7 @@ def align_indoor_outdoor(
 
     if len(matches) < 1:
         raise ValueError(
-            f"only {len(matches)} opening(s) matched (need >= 3) - detection or "
+            f"only {len(matches)} opening(s) matched (need >= 1) - detection or "
             "annotation quality is likely too sparse/wrong for this pair"
         )
 

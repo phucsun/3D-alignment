@@ -252,3 +252,37 @@ huống đối xứng/mơ hồ hình học thật, mới đánh giá được đ
 của thuật toán (không phải do lỗi thuật toán).
 
 42/42 unit test pass.
+
+---
+
+## Baseline (bài gốc) vs RGA — bằng chứng định lượng trực tiếp
+
+**File:** `scripts/compare_baseline_vs_rga.py` — chạy tự động cả 2 config (baseline = Hungarian
+thuần, không RANSAC consensus/ambiguity check/region/intrinsic fallback; RGA = đầy đủ) trên cùng
+1 bộ detection cho mỗi dataset, dễ mở rộng thêm dataset mới (chỉ cần thêm 1 `DatasetEntry`).
+
+6 dataset mới bổ sung (2026-08-13, cùng loại CloudCompare/LiDAR đã verify trước đó): `sc1_room1`,
+`sc2_room1`, `sc2_room3`, `sc2_room4`, `q1`, `q2`.
+
+| Dataset | Baseline | RGA | Ý nghĩa |
+|---|---|---|---|
+| sc1_room2 | 7/7, **sai 2 cặp** (residual ~2.97–2.99m, đối xứng nhầm) | 7/7 đúng hết (max 5cm) | RANSAC wall-consensus sửa đối xứng 2 chiều |
+| sc2_room4 (mới) | 4/4, **sai xoay vòng 3 object** (residual tới 1.47m) | 4/4 đúng hết (max 3cm) | RANSAC wall-consensus sửa được cả nhầm lẫn phức tạp hơn (xoay vòng, không chỉ đổi chỗ đôi) |
+| meeting_room | 3/3, **sai 1 cặp** (residual 0.53–1.12m) | 2/2 đúng (0.46cm) | ambiguity check + RANSAC loại đúng match giả |
+| q1 (mới) | **lỗi** (0 match — baseline không có intrinsic fallback, không match nổi scene chỉ 1 object) | **1/1, residual = 0.0** | bằng chứng thật đầu tiên cho C2 trên dữ liệu hoàn toàn mới, không phải dữ liệu đã biết trước |
+| sc1_room1, sc2_room1, sc2_room3 (mới) | đúng, khớp RGA | đúng | không có gì để robust hóa — baseline = RGA, đúng như kỳ vọng |
+| sc2_room2, sc2_room5, vkist, video1 | đúng, khớp RGA | đúng | không đổi so với trước |
+| q2 (mới) | lỗi | lỗi | **lỗi dữ liệu thật**: `Q2_outdoor` chưa được gán nhãn field cửa/sổ nào trong CloudCompare — không phải lỗi thuật toán, cần thu thập/gán nhãn lại |
+
+**2 sửa lỗi tương thích dữ liệu mới phát hiện khi mở rộng dataset** (không đổi hành vi trên dữ
+liệu cũ, đã regression-test):
+- `manual_segmentation._field_category`: chỉ nhận diện field tên `scalar_cua_ra_vao`/`scalar_cua_so_N`; dữ liệu mới (`q1`, `q2`) dùng quy ước ngắn hơn `scalar_Cua_N`/`scalar_cua_N` (không hậu tố, viết hoa khác) — bị bỏ qua âm thầm trước khi sửa. Đã thêm nhận diện không phân biệt hoa/thường + fallback "cua" trần → door.
+- Thông báo lỗi khi 0 match sai nội dung ("need >= 3" trong khi code chỉ chặn ở `< 1`) — đã sửa lại đúng "need >= 1".
+
+**Về `data/meeting-room/meeting_room1`, `meeting_room2` và `data/vkist_308/video1_v1..v3`:** đã
+đối chiếu (so ảnh frame đầu) — đây là **dữ liệu gốc (raw video + cache DA3) của `video1`/
+`meeting_room` đã test rồi**, chỉ được tổ chức lại vào `data/`, không phải dataset mới cần chạy
+lại pipeline detect.
+
+**Về CLIP (mục 8):** không bật trong bất kỳ config baseline/RGA nào ở trên — theo đúng quyết định
+giữ nó ở trạng thái tùy chọn, chỉ dùng khi có bằng chứng đủ tốt (hiện chưa có).

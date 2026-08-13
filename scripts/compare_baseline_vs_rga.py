@@ -118,11 +118,70 @@ DATASETS: list[DatasetEntry] = [
     DatasetEntry(
         "vkist",
         _load_cloudcompare(
-            "data/vkist/pantry-10-30 - Cloud - segment.ply",
-            "data/vkist/hanh-lang-10-34 - Cloud - segment.ply",
+            "data/vkist_lidar_pantry/pantry-10-30 - Cloud - segment.ply",
+            "data/vkist_lidar_pantry/hanh-lang-10-34 - Cloud - segment.ply",
         ),
         baseline_kwargs={},
         rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
+    ),
+    DatasetEntry(
+        "sc1_room1",
+        _load_cloudcompare(
+            "data/sc1-room1/scenario1_room1_indoor - Cloud - segment.ply",
+            "data/sc1-room1/scenario1_room1_outdoor - Cloud -segment.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
+    ),
+    DatasetEntry(
+        "sc2_room1",
+        _load_cloudcompare(
+            "data/sc2-room1/scenario2_room1_indoor - Cloud - segment.ply",
+            "data/sc2-room1/scenario2_room1_outdoor - Cloud - segment.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
+    ),
+    DatasetEntry(
+        "sc2_room3",
+        _load_cloudcompare(
+            "data/sc2-room3/scenario2_room3_indoor - Cloud - segment.ply",
+            "data/sc2-room3/scenario2_room3_outdoor - Cloud - segment.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
+    ),
+    DatasetEntry(
+        "sc2_room4",
+        _load_cloudcompare(
+            "data/sc2-room4/scenario2_room4_indoor - Cloud - segment.ply",
+            "data/sc2-room4/scenario2_room4_outdoor - Cloud - segment.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
+    ),
+    DatasetEntry(
+        # only 1 outdoor opening (0 neighbors) - needs intrinsic fallback
+        # (C2) to be matchable at all; baseline intentionally omits it,
+        # since the base paper has no such mechanism.
+        "q1",
+        _load_cloudcompare(
+            "data/q1/Q1_indoor/Q1_indoor_points - Cloud.ply",
+            "data/q1/Q1_outdoor/Q1_outdoor_points - Cloud.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
+    ),
+    DatasetEntry(
+        # Q2_outdoor has NO door/window scalar field at all (data not yet
+        # annotated in CloudCompare) - expected to fail until re-annotated.
+        "q2",
+        _load_cloudcompare(
+            "data/q2/Q2_indoor/Q2_indoor_points - Cloud.ply",
+            "data/q2/Q2_outdoor/Q2_outdoor_points - Cloud.ply",
+        ),
+        baseline_kwargs={},
+        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
     ),
     DatasetEntry(
         "video1",
