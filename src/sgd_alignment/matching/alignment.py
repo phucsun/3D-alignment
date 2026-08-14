@@ -37,6 +37,48 @@ def is_collinear(points: np.ndarray, ratio_threshold: float = 0.05) -> bool:
     return (singular_values[1] / singular_values[0]) < ratio_threshold
 
 
+def matches_span_single_wall(
+    detections: list[Detection3D],
+    matched_indices: list[int],
+    angle_threshold_deg: float = 20.0,
+) -> bool:
+    """True if every matched detection's wall normal points in (nearly) the
+    same direction - i.e. every match on this side was found on a single
+    wall.
+
+    IMPORTANT - what this does NOT mean: Kabsch's rotation is still fully,
+    uniquely determined even from a single matched box (confirmed on real
+    data - `home_phuc`: one match alone reproduces the exact same ~145
+    degree rotation as the full 2-match set, byte-for-byte; a real door's
+    distinct width/height/thickness rules out the rotational symmetry that
+    would make it genuinely ambiguous). So this is NOT a Kabsch/SVD
+    degeneracy check, and an earlier version of this function that framed
+    it that way (and an even earlier one that tried to detect it via the
+    corner point cloud's own coplanarity ratio) was wrong - confirmed on
+    real data: a genuinely single-wall case (`home_phuc`) and a healthy
+    multi-wall case (`sc2_room2`) gave the *same* corner-cloud thinness
+    ratio, because that ratio is dominated by the door's own physical
+    thickness (near-constant across real doors), not by wall diversity.
+
+    What single-wall matches actually lack is INDEPENDENT CROSS-
+    VALIDATION: with two separately/casually captured videos, each
+    reconstruction's coordinate frame has an arbitrary heading (whatever
+    direction the camera happened to start facing) - a large compass-like
+    rotation between indoor's and outdoor's frames is entirely expected
+    and not itself evidence of a bug. But with matches on only one wall,
+    there is no second, differently-oriented wall to confirm that rotation
+    is physically correct rather than an artifact of a wrong correspondence
+    or a wrong wall-normal convention upstream - the fit looks perfect (low
+    residual) either way, because residual alone cannot distinguish them.
+    """
+    normals = [detections[i].normal for i in matched_indices]
+    if len(normals) < 2:
+        return True
+    reference = normals[0]
+    cos_threshold = np.cos(np.radians(angle_threshold_deg))
+    return all(abs(float(np.dot(reference, n))) >= cos_threshold for n in normals[1:])
+
+
 def estimate_rigid_transform(
     src: np.ndarray, dst: np.ndarray, estimate_scale: bool = False
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -71,7 +113,7 @@ def estimate_rigid_transform(
         raise ValueError(f"need at least 3 correspondences for a 3D rigid transform, got {len(src)}")
     if is_collinear(src) or is_collinear(dst):
         warnings.warn(
-            "matched opening centers are (nearly) collinear - the rotation about "
+            "matched opening corners are (nearly) collinear - the rotation about "
             "that line's axis is poorly constrained; add a match off that line "
             "(e.g. a door/window on a different wall) before trusting this result",
             stacklevel=2,
@@ -433,6 +475,21 @@ def align_indoor_outdoor(
         )
         if len(matches) < 1:
             raise ValueError("RANSAC wall-consensus left 0 matches - detection quality likely too poor")
+
+    if matches_span_single_wall(
+        indoor_detections, [i for i, _, _ in matches]
+    ) or matches_span_single_wall(outdoor_detections, [j for _, j, _ in matches]):
+        warnings.warn(
+            "every matched opening shares the same wall normal on at least one "
+            "side - this rotation is still the unique Kabsch-optimal fit (not "
+            "mathematically ambiguous), but with only one wall's worth of "
+            "matches there is no independent cross-check that it is the "
+            "physically correct one rather than an artifact of a wrong "
+            "correspondence or wall-normal convention upstream; a low residual "
+            "does not rule that out. Add a match on a different wall before "
+            "trusting this alignment's orientation.",
+            stacklevel=2,
+        )
 
     src = np.concatenate([indoor_detections[i].corners() for i, _, _ in matches])
     dst = np.concatenate([outdoor_detections[j].corners() for _, j, _ in matches])

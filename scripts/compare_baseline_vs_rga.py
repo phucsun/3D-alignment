@@ -166,8 +166,8 @@ DATASETS: list[DatasetEntry] = [
         # since the base paper has no such mechanism.
         "q1",
         _load_cloudcompare(
-            "data/q1/Q1_indoor/Q1_indoor_points - Cloud.ply",
-            "data/q1/Q1_outdoor/Q1_outdoor_points - Cloud.ply",
+            "data/q1/Q1_indoor/Q1_indoor_points.ply",
+            "data/q1/Q1_outdoor/Q1_outdoor_points.ply",
         ),
         baseline_kwargs={},
         rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
@@ -177,8 +177,8 @@ DATASETS: list[DatasetEntry] = [
         # annotated in CloudCompare) - expected to fail until re-annotated.
         "q2",
         _load_cloudcompare(
-            "data/q2/Q2_indoor/Q2_indoor_points - Cloud.ply",
-            "data/q2/Q2_outdoor/Q2_outdoor_points - Cloud.ply",
+            "data/q2/Q2_indoor/Q2_indoor_points.ply",
+            "data/q2/Q2_outdoor/Q2_outdoor_points.ply",
         ),
         baseline_kwargs={},
         rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
