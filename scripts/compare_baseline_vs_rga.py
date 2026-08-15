@@ -166,8 +166,8 @@ DATASETS: list[DatasetEntry] = [
         # since the base paper has no such mechanism.
         "q1",
         _load_cloudcompare(
-            "data/q1/Q1_indoor/Q1_indoor_points.ply",
-            "data/q1/Q1_outdoor/Q1_outdoor_points.ply",
+            "data/Q1_indoor/Q1_indoor_points - Cloud.ply",
+            "data/Q1_outdoor/Q1_outdoor_points - Cloud.ply",
         ),
         baseline_kwargs={},
         rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),

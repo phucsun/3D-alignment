@@ -27,6 +27,13 @@ WORLD_UP = np.array([0.0, 0.0, 1.0])
 DOOR_FIELD_PREFIX = "scalar_cua_ra_vao"
 WINDOW_FIELD_PREFIX = "scalar_cua_so"
 GENERIC_DOOR_FIELD_PREFIX = "scalar_cua"  # bare "cua_1"/"Cua_2" naming, no "_ra_vao"/"_so" qualifier
+# CloudCompare's "Edit > Scalar Fields > Add constant SF" tool names the new
+# field literally "Constant" unless the person renames it - confirmed on
+# real data (Q1_outdoor): a second door selection was left with this default
+# name, silently dropping a whole opening (the exact same value-0/NaN-
+# elsewhere pattern as every recognized "cua_*" field, just unrenamed).
+# Assumed door (not window) since nothing in the name itself says otherwise.
+UNRENAMED_DEFAULT_FIELD = "scalar_constant"
 
 
 def _field_category(field_name: str) -> str | None:
@@ -43,6 +50,8 @@ def _field_category(field_name: str) -> str | None:
         return "window"
     if normalized.startswith(DOOR_FIELD_PREFIX):
         return "door"
+    if normalized == UNRENAMED_DEFAULT_FIELD:
+        return "door"
     if normalized.startswith(GENERIC_DOOR_FIELD_PREFIX):
         return "door"
     return None
@@ -52,6 +61,7 @@ def load_manual_segmentation(
     path: str | Path,
     is_outdoor: bool,
     up: np.ndarray | None = None,
+    camera_positions: np.ndarray | None = None,
 ) -> list[Detection3D]:
     """Read a CloudCompare-exported .ply with one `scalar_<name>` column
     per hand-segmented opening and return one Detection3D per opening.
@@ -59,6 +69,15 @@ def load_manual_segmentation(
     `is_outdoor` must say which side of the wall this scan was taken from
     - required to orient each wall's normal correctly, see
     `_orient_walls_outward`.
+
+    `camera_positions` (optional): pass the scanning device's recorded
+    `(N, 3)` positions (e.g. from a DA3/COLMAP source's poses) when
+    available - forwarded to `orient_walls_outward`, where it replaces
+    point-density asymmetry as the primary outward-orientation signal
+    (confirmed on real data to resolve cases where density is an
+    unreliable near-tie for one specific wall despite being clear-cut for
+    every other wall in the same scene). `None` (default) keeps the exact
+    prior density-only behavior for callers without pose data.
 
     Each opening's wall normal is taken from the nearest wall plane
     detected on the *whole* point cloud (via `plane_fitting`), not fit
@@ -82,7 +101,7 @@ def load_manual_segmentation(
 
     scene_up = up if up is not None else estimate_up_vector_manhattan(pc)
     walls = extract_wall_planes(pc, up=scene_up)
-    oriented_normals = orient_walls_outward(walls, pc, is_outdoor)
+    oriented_normals = orient_walls_outward(walls, pc, is_outdoor, camera_positions=camera_positions)
 
     detections = []
     for field_name in vertex.dtype.names:
