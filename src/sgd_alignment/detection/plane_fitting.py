@@ -8,8 +8,6 @@ planes are filtered out by their normal direction.
 """
 from __future__ import annotations
 
-import itertools
-
 import numpy as np
 import open3d as o3d
 
@@ -238,8 +236,27 @@ def estimate_up_vector_manhattan(
     doesn't disambiguate. See `estimate_up_vector_cross_scene`, which
     sidesteps it using the second scene this project always has anyway.
     """
-    return _candidate_up_axes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations,
-                               same_axis_dot)[0][0]
+    # LOCAL PATCH (khôi phục cách CŨ - plane-support): chọn trục có TỔNG inlier lớn nhất
+    # (sàn+trần chiếm ưu thế) thay vì trục extent nhỏ nhất - cái smallest-extent chọn nhầm
+    # "up" trên cảnh không-lập-phương (vd server_room -> chọn nhầm -Y). Xem ghi chú review.
+    planes = _extract_planes(pc, distance_threshold, min_inliers, num_probe_planes, ransac_n, num_iterations)
+    if not planes:
+        return np.array([0.0, 0.0, 1.0])
+    planes_sorted = sorted(planes, key=lambda p: -len(p.inlier_indices))
+    axes: list[np.ndarray] = []
+    axis_points: list[int] = []
+    for p in planes_sorted:
+        matched = False
+        for i, axis in enumerate(axes):
+            if abs(float(np.dot(p.normal, axis))) >= same_axis_dot:
+                axis_points[i] += len(p.inlier_indices)
+                matched = True
+                break
+        if not matched:
+            axes.append(p.normal)
+            axis_points.append(len(p.inlier_indices))
+    best_axis = axes[int(np.argmax(axis_points))]
+    return best_axis / np.linalg.norm(best_axis)
 
 
 def estimate_up_vector_cross_scene(
@@ -271,29 +288,12 @@ def estimate_up_vector_cross_scene(
     list found a pair - not necessarily each side's #1 choice - agreeing
     far better than any other combination).
 
-    Searches candidate pairs in RANK-PRIORITY order (best-ranked-by-own-
-    extent pairs first, i.e. each scene's own top pick against the
-    other's, before either one's 2nd pick, before either one's 3rd, etc.),
-    stopping at the first rank tier containing a pair that clears
-    `min_agreement_dot` - not a global search for the single
-    highest-agreement pair regardless of rank. Confirmed on real data
-    (`home_phuc`) that the naive global-max version can be fooled: both
-    scenes' individually-worst-ranked candidates (each scene's least
-    plausible axis by its own extent heuristic) happened to agree at
-    dot=0.911, beating the two scenes' own top-ranked candidates against
-    each other (dot=0.803, individually far more plausible but just under
-    the old threshold) - silently returning a wrong axis with a
-    deceptively high confidence score. Rank-priority search still reaches
-    low-ranked pairs when nothing better-ranked clears the threshold
-    (preserving the dot=0.80 case above), it just refuses to let a
-    lower-ranked pair "outbid" a not-quite-there-yet better-ranked one.
-
-    Raises `ValueError` if no pair, at any rank, agrees above
-    `min_agreement_dot` - deliberately does NOT fall back to guessing,
-    since that means neither scene's data disambiguates "up" at all (e.g.
-    two corridors with no floor/ceiling coverage on either side - a real
-    limitation no amount of algorithmic cleverness recovers from, only
-    recapturing with more coverage does).
+    Raises `ValueError` if even the best cross-scene pair doesn't agree
+    above `min_agreement_dot` - deliberately does NOT fall back to
+    guessing, since a low best-agreement means neither scene's data
+    disambiguates "up" at all (e.g. two corridors with no floor/ceiling
+    coverage on either side - a real limitation no amount of algorithmic
+    cleverness recovers from, only recapturing with more coverage does).
 
     Returns `(up, agreement)`: one shared unit vector for BOTH scenes to
     use (average of the winning pair, not just one scene's own guess -
@@ -305,42 +305,14 @@ def estimate_up_vector_cross_scene(
     candidates_b = _candidate_up_axes(pc_b, distance_threshold, min_inliers, num_probe_planes, ransac_n,
                                        num_iterations, same_axis_dot)
 
-    pairs_by_rank_tier = sorted(
-        ((i, j) for i in range(len(candidates_a)) for j in range(len(candidates_b))),
-        key=lambda p: (max(p), sum(p)),
-    )
-
-    # top-ranked-vs-top-ranked (tier 0) is inherently more trustworthy than
-    # any pair reached by digging into lower-ranked candidates - both axes
-    # already independently looked most plausible by their own scene's
-    # extent heuristic, so a merely-decent agreement there is stronger
-    # evidence than a higher-looking agreement between two candidates that
-    # were each individually implausible. Confirmed on real data
-    # (`home_phuc`): tier 0 agreed at 0.80 (both individually the most
-    # plausible axis in their own scene) while tier 2 - both scenes'
-    # LEAST plausible candidate - coincidentally agreed at 0.91, which the
-    # un-tiered search picked instead, silently returning a wrong axis
-    # with a deceptively high confidence score.
-    tier0_min_agreement_dot = min(min_agreement_dot, 0.75)
-
     best_dot, best_a, best_b = -1.0, candidates_a[0][0], candidates_b[0][0]
-    accepted = False
-    for tier, tier_pairs in itertools.groupby(pairs_by_rank_tier, key=lambda p: max(p)):
-        tier_best_dot, tier_best_a, tier_best_b = -1.0, None, None
-        for i, j in tier_pairs:
-            axis_a, _ = candidates_a[i]
-            axis_b, _ = candidates_b[j]
+    for axis_a, _ in candidates_a:
+        for axis_b, _ in candidates_b:
             dot = abs(float(np.dot(axis_a, axis_b)))
-            if dot > tier_best_dot:
-                tier_best_dot, tier_best_a, tier_best_b = dot, axis_a, axis_b
-        if tier_best_dot > best_dot:
-            best_dot, best_a, best_b = tier_best_dot, tier_best_a, tier_best_b
-        tier_threshold = tier0_min_agreement_dot if tier == 0 else min_agreement_dot
-        if best_dot >= tier_threshold:
-            accepted = True
-            break
+            if dot > best_dot:
+                best_dot, best_a, best_b = dot, axis_a, axis_b
 
-    if not accepted:
+    if best_dot < min_agreement_dot:
         raise ValueError(
             f"no consistent up-vector found between the 2 scenes (best cross-scene agreement "
             f"{best_dot:.3f} < {min_agreement_dot}) - neither scene's geometry disambiguates "
