@@ -5,6 +5,14 @@
 > **(1) Vấn đề nó giải quyết** — tại sao bước này tồn tại, **(2) Code** — trích nguyên văn
 > đoạn xử lý cùng đường dẫn file:dòng, **(3) Giải thích** — công thức/thuật toán hoạt động
 > thế nào, kể cả các bước lọc lỗi nhỏ nhất (ngưỡng, NMS, percentile trim...).
+>
+> **Cập nhật sau khi hợp nhất nhánh Minh (QuangMinhPham)**: kể từ `CONTRIBUTIONS.md` mục 11,
+> pipeline **gravity-locked** (`gravity_align.py` + `robust_align.py`, orchestration ở
+> [`scripts/align_gravity_pipeline.py`](../scripts/align_gravity_pipeline.py)) là **pipeline
+> chính** cho MỌI dữ liệu có camera pose (`results.npz`) — cả CloudCompare thủ công lẫn
+> auto-detect (Grounding DINO+SAM2). Nhánh SGD gốc (`align_indoor_outdoor`, B1–B5) chỉ còn
+> giữ vai trò chính cho dữ liệu LiDAR thuần không có camera pose. Phần B6/B7 dưới đây đã cập
+> nhật lại theo đúng vai trò mới này (không còn gọi là "nhánh thay thế" nữa).
 
 ## Mục lục
 
@@ -22,14 +30,15 @@
   - [A9. Đo kích thước từng opening → Detection3D](#a9-đo-kích-thước-từng-opening--detection3d)
   - [A10. Xuất kết quả](#a10-xuất-kết-quả)
 - [Giai đoạn B — Matching & Alignment](#giai-đoạn-b--matching--alignment)
-  - [B0. Orchestration](#b0-orchestration--align_pipelinepy)
-  - [B1. SGD: Semantic-Geometric Descriptor](#b1-sgd-semantic-geometric-descriptor)
+  - [B0. Orchestration — 2 pipeline song song](#b0-orchestration--2-pipeline-song-song)
+  - [B0b. Orchestration (nhánh SGD)](#b0b-orchestration-nhánh-sgd-không-có-camera-pose--align_pipelinepy)
+  - [B1. SGD: Semantic-Geometric Descriptor (dữ liệu không có camera pose)](#b1-sgd-semantic-geometric-descriptor-dữ-liệu-không-có-camera-pose)
   - [B2. Hungarian 2 tầng](#b2-hungarian-2-tầng)
   - [B3. Kabsch / Umeyama — tính (R, t, scale)](#b3-kabsch--umeyama--tính-r-t-scale)
   - [B4. Các lớp lọc/tinh chỉnh sau matching](#b4-các-lớp-lọctinh-chỉnh-sau-matching)
   - [B5. Ghép nhiều phòng vào 1 hub](#b5-ghép-nhiều-phòng-vào-1-hub)
-  - [B6. Nhánh thay thế "up-free": robust_align.py](#b6-nhánh-thay-thế-up-free-robust_alignpy)
-  - [B7. Nhánh gravity-locked: gravity_align.py](#b7-nhánh-gravity-locked-gravity_alignpy)
+  - [B6. Up-free descriptor: robust_align.py](#b6-up-free-descriptor-robust_alignpy)
+  - [B7. Pipeline chính cho dữ liệu có camera pose: gravity_align.py](#b7-pipeline-chính-cho-dữ-liệu-có-camera-pose-gravity_alignpy)
 - [Phụ lục: bảng tổng hợp mọi ngưỡng lọc lỗi](#phụ-lục-bảng-tổng-hợp-mọi-ngưỡng-lọc-lỗi)
 - [Phụ lục: cấu trúc dữ liệu dùng chung](#phụ-lục-cấu-trúc-dữ-liệu-dùng-chung)
 
@@ -50,15 +59,16 @@
         │                                              │
         ▼ (indoor)                                     ▼ (outdoor)
 ┌─────────────────────── GIAI ĐOẠN B: MATCHING + ALIGNMENT ───────────────────┐
-│  Nhánh chính (paper gốc):                                                    │
-│   B1 SGD descriptor ──► B2 Hungarian 2 tầng ──► B3 Kabsch/Umeyama (R,t,scale) │
-│      ──► B4 refine (geometric consensus / RANSAC wall consensus)             │
-│                                                                                │
-│  Nhánh thay thế (up-free, mới hơn):                                          │
+│  CÓ camera pose (results.npz) -> PIPELINE CHÍNH (scripts/align_gravity_     │
+│  pipeline.py), cả CloudCompare thủ công lẫn auto-detect (raw_clusters.pkl): │
 │   B6 robust_align: up-free descriptor ──► triangle/2-opening hypotheses      │
 │      ──► Hungarian-với-dummy scoring ──► refit lặp                           │
 │   B7 gravity_align: khoá trục up từ camera + camera-side voting              │
 │      (giải quyết ca chỉ match được đúng 1 tường — rank-1 degeneracy)         │
+│                                                                                │
+│  KHÔNG có camera pose (LiDAR thuần) -> pipeline SGD gốc (align_pipeline.py): │
+│   B1 SGD descriptor ──► B2 Hungarian 2 tầng ──► B3 Kabsch/Umeyama (R,t,scale) │
+│      ──► B4 refine (geometric consensus / RANSAC wall consensus)             │
 └────────────────────────────────────────────────────────────────────────────┘
         │
         ▼
@@ -795,6 +805,15 @@ detections_path = output_dir / f"{config.output_name}_detections.pkl"
 with open(detections_path, "wb") as f:
     pickle.dump(detections, f)
 
+# Lưu THÊM cụm điểm thô (chưa qua wall-plane attribution) dạng OpeningCluster,
+# song song với detections.pkl - để align_gravity_pipeline.py (B7) dùng được
+# dữ liệu auto-detect mà không cần detect lại từ đầu.
+from sgd_alignment.matching.robust_align import OpeningCluster
+raw_clusters_path = output_dir / f"{config.output_name}_raw_clusters.pkl"
+raw_clusters = [OpeningCluster(category=c["label"], points=c["points"]) for c in merged]
+with open(raw_clusters_path, "wb") as f:
+    pickle.dump(raw_clusters, f)
+
 review_path = output_dir / f"{config.output_name}_openings.ply"
 _export_review_ply(scene_points, scene_colors, merged, review_path)   # tô màu opening trên scene
 
@@ -802,17 +821,82 @@ scene_path = output_dir / f"{config.output_name}_scene.ply"
 _export_review_ply(scene_points, scene_colors, [], scene_path)        # scene gốc, không tô
 ```
 
-**Giải thích**: `detections` (list `Detection3D`) được lưu `.pkl` — input trực tiếp cho
-Giai đoạn B (`align_pipeline.py` đọc lại bằng `pickle.load`). File `.ply` review tô màu
-riêng biệt cửa (xanh lá) / cửa sổ (xanh dương) đè lên scene xám — mục đích kiểm tra bằng
-mắt (CloudCompare/MeshLab) trước khi tin tưởng chạy tiếp bước matching, vì đây là pipeline
-headless không có notebook hiển thị trực tiếp.
+**Giải thích**: `detections` (list `Detection3D`, đã qua wall-plane attribution A7-A9) được
+lưu `.pkl` — input cho nhánh SGD gốc (`align_pipeline.py`, B1-B5), dùng cho dữ liệu KHÔNG có
+camera pose. Từ commit *"Nối luồng auto-detect vào pipeline gravity chính"*, mỗi lần chạy
+còn xuất **thêm** `<name>_raw_clusters.pkl` — cụm điểm thô dạng `OpeningCluster` (category +
+points, CHƯA qua A7/A8 dò-tường-toàn-cảnh) — để `scripts/align_gravity_pipeline.py` (B7, giờ
+là **pipeline chính** cho dữ liệu có camera pose) đọc trực tiếp mà không cần chạy lại
+detection. Đây là 2 sản phẩm xuất **song song**, không thay thế nhau: `detections.pkl` phục
+vụ nhánh SGD, `raw_clusters.pkl` phục vụ nhánh gravity — cùng input ảnh/pose, chạy 1 lần A1-A6.
+
+File `.ply` review tô màu riêng biệt cửa (xanh lá) / cửa sổ (xanh dương) đè lên scene xám —
+mục đích kiểm tra bằng mắt (CloudCompare/MeshLab) trước khi tin tưởng chạy tiếp bước
+matching, vì đây là pipeline headless không có notebook hiển thị trực tiếp.
 
 ---
 
 ## Giai đoạn B — Matching & Alignment
 
-### B0. Orchestration — `align_pipeline.py`
+### B0. Orchestration — 2 pipeline song song
+
+Kể từ khi hợp nhất nhánh Minh, có **2 script orchestration độc lập**, chọn theo dữ liệu có
+camera pose hay không:
+
+| | `scripts/align_gravity_pipeline.py` (B7, **pipeline chính**) | `align_pipeline.py` (B1–B5) |
+|---|---|---|
+| Dùng khi | Có `results.npz` (camera pose) — **mọi** dữ liệu multi-view/DA3/COLMAP hiện tại của project | Không có camera pose (LiDAR thuần: `sc1/sc2_room*`, `vkist`) |
+| Input opening | `OpeningCluster` thô (CloudCompare hoặc `<name>_raw_clusters.pkl`) | `Detection3D` đã trừu tượng hoá (`<name>_detections.pkl`) |
+| Matcher | `gravity_align.align_gravity_camera` (khoá gravity + camera-side) | `alignment.align_indoor_outdoor` (SGD + Hungarian) |
+| Vì sao chọn làm chính | Không phụ thuộc `extract_wall_planes` dò tường toàn cảnh — né được bug tường-hốc-lõm (RANSAC tách 1 tường thật thành nhiều mặt ứng viên gần nhau, sai hướng) đã xác nhận trên dữ liệu thật `chua_thay`; xem `CONTRIBUTIONS.md` mục 11 | Vẫn cần cho dữ liệu không có `results.npz` để suy gravity |
+
+**Code — `align_gravity_pipeline.py`**: [`scripts/align_gravity_pipeline.py:158-181`](../scripts/align_gravity_pipeline.py#L158-L181)
+
+```python
+def run(entry: GravityDatasetEntry, output_dir: str = "outputs/final_aligned") -> None:
+    indoor_clusters, outdoor_clusters, cam_indoor, cam_outdoor = entry.load_openings()
+    result = align_gravity_camera(indoor_clusters, outdoor_clusters, cam_indoor, cam_outdoor)
+    print(f"  status={result.status}  reason={result.reason}")
+
+    pts_in, cols_in = _read_ply(entry.indoor_scene_ply)
+    pts_out, cols_out = _read_ply(entry.outdoor_scene_ply)
+    aligned_in = transform_points(pts_in, result.s, result.R, result.t)   # LƯU Ý: có "s" (scale)
+    all_pts = np.concatenate([aligned_in, pts_out])
+    ...
+    _write_ply(all_pts, all_cols, out_path)
+```
+
+`entry.load_openings()` trừu tượng hoá 2 nguồn dữ liệu đầu vào về cùng 1 kiểu trả về
+(`list[OpeningCluster], list[OpeningCluster], CameraEvidence, CameraEvidence`):
+
+```python
+def _manual_segmentation_loader(indoor_ply, indoor_npz, outdoor_ply, outdoor_npz) -> OpeningLoader:
+    def _load():
+        return (openings_from_manual_segmentation(indoor_ply),
+                openings_from_manual_segmentation(outdoor_ply),
+                camera_evidence(indoor_npz), camera_evidence(outdoor_npz))
+    return _load
+
+def _auto_detect_loader(indoor_pkl, indoor_npz, outdoor_pkl, outdoor_npz) -> OpeningLoader:
+    """indoor_pkl/outdoor_pkl: <name>_raw_clusters.pkl do multiview_pipeline.run_pipeline lưu (A10)."""
+    def _load():
+        with open(indoor_pkl, "rb") as f: indoor_clusters = pickle.load(f)
+        with open(outdoor_pkl, "rb") as f: outdoor_clusters = pickle.load(f)
+        return indoor_clusters, outdoor_clusters, camera_evidence(indoor_npz), camera_evidence(outdoor_npz)
+    return _load
+```
+
+**Giải thích**: đây chính là lợi ích của việc `OpeningCluster` (B6) và
+`openings_from_manual_segmentation` cùng trả về 1 kiểu dữ liệu — `align_gravity_camera`
+(B7) hoàn toàn không cần biết opening đến từ CloudCompare tay hay từ Grounding DINO+SAM2 tự
+động. `DATASETS` là danh sách khai báo tĩnh từng bộ dữ liệu (Q1, Q2, server, room310,
+chua_thay dùng nguồn thủ công; `q815` dùng nguồn auto-detect qua `raw_clusters.pkl`) — chạy
+`python scripts/align_gravity_pipeline.py` sẽ lặp qua toàn bộ, in `status`/`reason` từng
+cặp, và xuất `.ply` đã ghép vào `outputs/final_aligned/`.
+
+---
+
+### B0b. Orchestration (nhánh SGD, không có camera pose) — `align_pipeline.py`
 
 **Vấn đề giải quyết**: nối kết quả detection của 2 bên (indoor/outdoor, mỗi bên chạy
 `multiview_pipeline.py` riêng) lại, chạy matching+alignment, rồi áp transform lên **toàn bộ
@@ -853,7 +937,7 @@ tắt cả 2 cờ này.
 
 ---
 
-### B1. SGD: Semantic-Geometric Descriptor
+### B1. SGD: Semantic-Geometric Descriptor (dữ liệu không có camera pose)
 
 **Vấn đề giải quyết**: matching 2 tập object rời rạc (indoor/outdoor) không thể chỉ so
 "khoảng cách tuyệt đối" (2 scene có hệ toạ độ, gốc, hướng hoàn toàn khác nhau) — cần 1 mô
@@ -1250,13 +1334,20 @@ không phải hub) tự động thua chi phí khi so với tường hub thật, 
 
 ---
 
-### B6. Nhánh thay thế "up-free": `robust_align.py`
+### B6. Up-free descriptor: `robust_align.py`
 
-**Vấn đề giải quyết**: toàn bộ nhánh B1–B5 phụ thuộc `Detection3D.u_axis/v_axis/normal` —
-mà các trục này lại phụ thuộc `up` đã ước lượng ở A6. Nếu `up` sai (case khó — scene ít đặc
+**Vai trò hiện tại**: đây là lớp descriptor + matcher nền tảng mà B7 (`gravity_align.py`,
+pipeline chính cho dữ liệu có camera pose) xây trên đó (`build_opening`, `umeyama`,
+`_matched_wall_normal`, `_axis_rotation`, `OpeningCluster`, `transform_points` đều được B7
+import trực tiếp — xem `gravity_align.py:34-37`). File này cũng có **matcher độc lập riêng**
+(`match_openings`) không cần camera pose, dùng khi chỉ có point cloud thô mà không có
+`results.npz` — nhưng trong project hiện tại, đường chạy chính qua nó vẫn là qua B7.
+
+**Vấn đề gốc nó giải quyết**: nhánh B1–B5 (SGD) phụ thuộc `Detection3D.u_axis/v_axis/normal`
+— mà các trục này lại phụ thuộc `up` đã ước lượng ở A6. Nếu `up` sai (case khó — scene ít đặc
 trưng hình học), mọi thứ phía trên sai theo mà không có cách tự phát hiện. `robust_align.py`
-thiết kế lại matching **không tin bất kỳ đại lượng nào phụ thuộc up** — tính lại descriptor
-trực tiếp từ cụm điểm thô, "sign-free" (không giả định trước dấu/hướng).
+thiết kế lại descriptor **không tin bất kỳ đại lượng nào phụ thuộc up** — tính lại trực tiếp
+từ cụm điểm thô, "sign-free" (không giả định trước dấu/hướng).
 
 **Code — descriptor up-free 1 opening**: [`robust_align.py:81-145`](../src/sgd_alignment/matching/robust_align.py#L81-L145)
 
@@ -1537,13 +1628,19 @@ else:
 
 ---
 
-### B7. Nhánh gravity-locked: `gravity_align.py`
+### B7. Pipeline chính cho dữ liệu có camera pose: `gravity_align.py`
 
-**Vấn đề giải quyết**: giải quyết đúng ca `AMBIGUOUS/rank-1` của B6 — khi mọi opening khớp
-được chỉ nằm trên **1 tường chung**, roll quanh pháp tuyến tường đó (và với 2 cửa nằm ngang
-hàng, cả "cửa nào bên nào" + "trên/dưới") **không quan sát được** chỉ từ hình học opening.
-File này bổ sung 2 tín hiệu **độc lập, đáng tin** lấy thẳng từ dữ liệu camera gốc để phá vỡ
-sự mơ hồ đó.
+**Vai trò hiện tại**: `align_gravity_camera` (hàm chính của file này) là hàm matching+align
+mà [`scripts/align_gravity_pipeline.py`](../scripts/align_gravity_pipeline.py) (B0) gọi cho
+**mọi** dataset có `results.npz` trong project — thay thế hoàn toàn nhánh SGD (B1–B5) cho
+nhóm dữ liệu này (xem bảng so sánh ở B0). Về mặt kỹ thuật, nó là lớp giải quyết đúng ca
+`AMBIGUOUS/rank-1` của B6 (`robust_align.match_openings`) — khi mọi opening khớp được chỉ
+nằm trên **1 tường chung**, roll quanh pháp tuyến tường đó (và với 2 cửa nằm ngang hàng, cả
+"cửa nào bên nào" + "trên/dưới") **không quan sát được** chỉ từ hình học opening. File này
+bổ sung 2 tín hiệu **độc lập, đáng tin** lấy thẳng từ dữ liệu camera gốc để phá vỡ sự mơ hồ
+đó — và trên thực tế, đây cũng chính là lý do nó được chọn làm pipeline chính: không cần
+`extract_wall_planes` (A7, dò tường toàn cảnh) nên né được bug tường-hốc-lõm đã xác nhận
+trên `chua_thay` (xem `CONTRIBUTIONS.md` mục 11).
 
 **Code — 2 tín hiệu camera lấy từ `.npz`**: [`gravity_align.py:43-64`](../src/sgd_alignment/matching/gravity_align.py#L43-L64)
 
