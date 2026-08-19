@@ -231,6 +231,22 @@ def run_pipeline(config: MultiviewPipelineConfig, segmenter=None) -> list[Detect
     with open(detections_path, "wb") as f:
         pickle.dump(detections, f)
     log.info("saved %d detection(s) -> %s", len(detections), detections_path)
+
+    # Also save the RAW merged clusters (category + points, before any
+    # whole-scene wall-plane attribution) as `robust_align.OpeningCluster`
+    # objects - lets `align_gravity_pipeline.py` run the gravity-locked
+    # pipeline (`gravity_align.align_gravity_camera`) on auto-detected
+    # (Grounding DINO + SAM2) openings too, not just CloudCompare manual
+    # segmentation, without re-running detection from scratch. `_detections`
+    # above stay the primary output for `align_indoor_outdoor`; this is an
+    # additional, cheap-to-produce artifact alongside it.
+    from sgd_alignment.matching.robust_align import OpeningCluster
+
+    raw_clusters_path = output_dir / f"{config.output_name}_raw_clusters.pkl"
+    raw_clusters = [OpeningCluster(category=c["label"], points=c["points"]) for c in merged]
+    with open(raw_clusters_path, "wb") as f:
+        pickle.dump(raw_clusters, f)
+    log.info("saved %d raw opening cluster(s) -> %s", len(raw_clusters), raw_clusters_path)
     for d in detections:
         log.info("  %s: center=%s, size=%.2f x %.2f, normal=%s",
                   d.category, np.round(d.center, 3), d.width, d.height, np.round(d.normal, 3))
