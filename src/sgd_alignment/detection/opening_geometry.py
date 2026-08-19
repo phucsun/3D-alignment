@@ -155,6 +155,102 @@ def nearest_wall_normal(
     return oriented_normals[best_idx]
 
 
+def opening_normal_line(points: np.ndarray, up: np.ndarray, verticality_max_dot: float = 0.34) -> tuple[np.ndarray | None, bool]:
+    """Up-free, sign-invariant plane normal fit directly to ONE opening's
+    own raw point cluster - no dependency on any whole-scene wall-plane
+    detection. `n` and `-n` are treated as identical (a plane's normal
+    has no inherent sign from a bare PCA fit); a caller that needs a
+    correctly-ORIENTED (outward-pointing) normal must resolve the sign
+    itself (`aggregate_oriented_wall_normal` below does this via an
+    already-trusted reference direction - never assume this function's
+    own sign convention means anything).
+
+    Returns `(normal, reliable)`. `reliable=False` (normal still
+    returned, just flagged) when the cluster's own normal isn't
+    reasonably vertical (`|dot(normal, up)| >= verticality_max_dot`,
+    ~20 degrees off a true wall) - a cluster that fit a near-horizontal
+    plane isn't sitting flush on a wall, so its normal carries no
+    trustworthy wall-orientation information. Also `None`/unreliable for
+    a cluster too small to fit a plane meaningfully.
+    """
+    if len(points) < 10:
+        return None, False
+    centroid = points.mean(axis=0)
+    _, _, vt = np.linalg.svd(points - centroid, full_matrices=False)
+    normal = vt[-1]
+    normal = normal / (np.linalg.norm(normal) + 1e-12)
+    reliable = abs(float(np.dot(normal, up))) < verticality_max_dot
+    return normal, reliable
+
+
+def aggregate_wall_normal(clusters: list[np.ndarray], up: np.ndarray, max_resid_deg: float = 8.0) -> tuple[np.ndarray | None, bool]:
+    """Aggregate several openings' own per-cluster normals
+    (`opening_normal_line`) into ONE stable, sign-invariant wall-normal
+    estimate, via a sign-invariant scatter matrix (n and -n contribute
+    identically, so openings on the exact same wall never cancel each
+    other out just because their individual PCA fits happened to land on
+    opposite signs).
+
+    More robust for unusual/decorative architecture than reading a normal
+    off a whole-scene RANSAC wall-plane list, because it never needs to
+    decide WHICH detected wall plane an opening belongs to in the first
+    place (confirmed on real data - `chua_thay` - where a window-reveal's
+    inner/outer faces fragment whole-scene wall detection into multiple
+    close, inconsistent candidate planes; this aggregation sidesteps that
+    entirely by working from each opening's own immediate points).
+
+    Returns `(normal, reliable)` - `normal`'s sign is ARBITRARY (see
+    `opening_normal_line`); `reliable=False` when no cluster passed
+    `opening_normal_line`'s verticality check, or the surviving
+    per-cluster normals don't agree with each other well (median angular
+    residual to the aggregate >= `max_resid_deg`) - the latter usually
+    means the given openings aren't actually all on the same physical
+    wall, so aggregating them is not meaningful.
+    """
+    normals = []
+    for points in clusters:
+        normal, reliable = opening_normal_line(points, up)
+        if normal is not None and reliable:
+            normals.append(normal)
+    if not normals:
+        return None, False
+    scatter = sum(np.outer(n, n) for n in normals)
+    eigenvalues, eigenvectors = np.linalg.eigh(scatter)
+    aggregate = eigenvectors[:, -1]
+    residuals_deg = [
+        float(np.degrees(np.arccos(np.clip(abs(float(np.dot(n, aggregate))), 0.0, 1.0))))
+        for n in normals
+    ]
+    reliable = float(np.median(residuals_deg)) < max_resid_deg
+    return aggregate, reliable
+
+
+def aggregate_oriented_wall_normal(
+    clusters: list[np.ndarray], reference_normals: list[np.ndarray], up: np.ndarray, max_resid_deg: float = 8.0
+) -> tuple[np.ndarray | None, bool]:
+    """Same as `aggregate_wall_normal`, but SIGN-RESOLVED: the raw
+    aggregate is sign-invariant (see that function), so it's flipped to
+    agree with the mean of `reference_normals` (e.g. the openings' own
+    already-reliably-oriented `Detection3D.normal`, from
+    `orient_walls_outward`) whenever they disagree.
+
+    Any caller that cares about ANTIPARALLEL vs PARALLEL (not just "same
+    line") - e.g. checking 2 matched walls face directly away from each
+    other - must use this, not the bare sign-invariant version: using an
+    arbitrarily-signed normal to decide "should I rotate 0 degrees or 180
+    degrees" is a real bug this project hit once already (a ~180-degree
+    misfire that blew up alignment residuals into the thousands on real
+    data) - see CONTRIBUTIONS.md.
+    """
+    aggregate, reliable = aggregate_wall_normal(clusters, up, max_resid_deg)
+    if aggregate is None:
+        return None, False
+    reference = np.mean(reference_normals, axis=0)
+    if np.dot(aggregate, reference) < 0:
+        aggregate = -aggregate
+    return aggregate, reliable
+
+
 def points_to_detection(
     points: np.ndarray,
     category: str,

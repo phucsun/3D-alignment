@@ -131,6 +131,7 @@ def detections_from_clusters(
     is_outdoor: bool,
     up: np.ndarray | None = None,
     trim_percentile: float = 0.0,
+    camera_positions: np.ndarray | None = None,
 ) -> list[Detection3D]:
     """Measure each merged opening cluster against the scene's own wall
     planes (reusing exactly the same logic `manual_segmentation.py` uses
@@ -152,11 +153,20 @@ def detections_from_clusters(
     here sidesteps a bad estimate on a poorly-covered one.
 
     `trim_percentile`: forwarded to `points_to_detection` - see there.
+
+    `camera_positions` (optional, `(N, 3)`): scanning device positions for
+    this scene (e.g. from a DA3/COLMAP source's poses) - forwarded to
+    `orient_walls_outward`, where it replaces point-density asymmetry as
+    the primary outward-orientation signal (same fix as
+    `manual_segmentation.load_manual_segmentation`'s `camera_positions` -
+    see that function and `opening_geometry.orient_walls_outward` for why
+    density alone can silently pick the wrong side). `None` (default) keeps
+    the exact prior density-only behavior.
     """
     scene_pc = PointCloud(points=scene_points)
     up = up if up is not None else estimate_up_vector_manhattan(scene_pc)
     walls = extract_wall_planes(scene_pc, up=up)
-    oriented_normals = orient_walls_outward(walls, scene_pc, is_outdoor)
+    oriented_normals = orient_walls_outward(walls, scene_pc, is_outdoor, camera_positions=camera_positions)
 
     detections = []
     for cluster in clusters:
@@ -176,15 +186,18 @@ def build_detections_from_instances(
     up: np.ndarray | None = None,
     min_confidence: float = 0.0,
     trim_percentile: float = 0.0,
+    camera_positions: np.ndarray | None = None,
 ) -> list[Detection3D]:
     """Full detection-side pipeline: backproject every 2D instance to 3D,
     merge duplicates seen from multiple views, then measure each merged
     opening (`detections_from_clusters`) to produce `Detection3D`s ready
     for `sgd_alignment.matching`. See `detections_from_clusters` for `up`/
-    `trim_percentile`, and `backproject_instances` for `min_confidence`.
+    `trim_percentile`/`camera_positions`, and `backproject_instances` for
+    `min_confidence`.
     """
     raw_instances = backproject_instances(source, instances, scale=scale, depth_range=depth_range,
                                            min_confidence=min_confidence)
     merged = merge_instances(raw_instances, merge_distance=merge_distance)
     scene_points, _ = source.build_scene_point_cloud()
-    return detections_from_clusters(scene_points * scale, merged, is_outdoor, up=up, trim_percentile=trim_percentile)
+    return detections_from_clusters(scene_points * scale, merged, is_outdoor, up=up, trim_percentile=trim_percentile,
+                                     camera_positions=camera_positions)

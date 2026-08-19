@@ -237,6 +237,106 @@ huống đối xứng/mơ hồ hình học thật, mới đánh giá được đ
 
 ---
 
+## 9. Hướng tường ra ngoài dùng camera pose thay mật độ điểm ✅
+
+**File:** `src/sgd_alignment/detection/opening_geometry.py` (`orient_walls_outward`),
+`src/sgd_alignment/detection/manual_segmentation.py` (`camera_positions` param)
+
+Bug thật phát hiện trên dữ liệu `server`/`home_phuc`: heuristic mật độ điểm 2 bên tường (nhiều
+điểm hơn = phía trong) có thể gần như 50/50 cho một bức tường cụ thể (`server`: 0.2996 vs 0.2256,
+margin 0.074) dù các tường khác trong CÙNG scene rất dứt khoát (margin 0.78–0.94) — không có tín
+hiệu nào cho biết quyết định đó gần như tung đồng xu, khiến indoor/outdoor bị ghép lộn cùng 1 phía
+tường mà residual/cost không hề bất thường.
+
+Khi có `results.npz` (camera pose) cho cả 2 phía: vị trí camera so với mặt phẳng tường là **sự
+thật hình học cứng**, không phải thống kê — máy quay đứng ở phía nào thì chắc chắn ở phía đó, dùng
+làm tín hiệu chính thay mật độ điểm (mật độ vẫn tính để đối chiếu chéo).
+
+**Kiểm chứng bằng phép thử signed-distance độc lập** (không dùng residual/cost, vốn đã được xác
+nhận KHÔNG phát hiện được lỗi này): biến đổi centroid 1 scene bằng (R, t) đã tính, so dấu khoảng
+cách có dấu tới mặt phẳng cửa đã ghép với dấu của chính centroid scene còn lại — cùng dấu = 2
+không gian bị lồng cùng phía (sai), khác dấu = đúng 2 phía đối diện tường. Xác nhận trên `q1`,
+`q2`, `server` (đều có camera pose): trước fix ít nhất 1/3 bộ SAI (cùng phía), sau fix cả 3 đều
+ĐÚNG (khác phía) — không cần fix riêng cho bộ nào.
+
+**Kiểm chứng:** regression 0 lỗi trên toàn bộ dataset CloudCompare cũ (`camera_positions=None` giữ
+nguyên hành vi cũ 100%); `tests/test_sgd_matching.py`.
+
+---
+
+## 10. Bộ mô tả tỉ lệ rộng/cao riêng từng vật thể (aspect_ratio_weight) 🔶
+
+**File:** `src/sgd_alignment/matching/sgd.py` (`PairWeights.aspect_ratio_weight`, `_aspect_ratio_diff`)
+
+Ý tưởng: mô tả quan hệ gốc (SGDU — khoảng cách/góc tới vật thể lân cận) không hề dùng kích
+thước/tỉ lệ TUYỆT ĐỐI của chính vật thể đang so khớp. Khi 2 bức tường có khoảng cách giữa các cửa
+tình cờ gần giống nhau, về lý thuyết matching có thể chọn nhầm tường dù kích thước cửa khác nhau
+rõ rệt — thêm tùy chọn `aspect_ratio_weight` (mặc định `0.0`, tắt) để cộng thêm chênh lệch tỉ lệ
+rộng/cao bất biến-tỉ-lệ vào cost quan hệ đã tính, chỉ cộng khi cost quan hệ vẫn hữu hạn (không bao
+giờ "cứu" lại một cặp đã bị loại vì sai category/ngưỡng).
+
+**Đã tự kiểm tra lại và RÚT LẠI claim ban đầu:** lần đầu tưởng đã xác nhận `weight=1.0` sửa lỗi
+chọn nhầm tường trên `server` (tường sai cost 0.2277 → tường đúng), nhưng đó là do lúc test còn
+thiếu `estimate_scale`/`normalize_distance` cho dữ liệu này (dữ liệu `server` tái dựng từ DA3,
+giống `q1`/`q2`, KHÔNG phải LiDAR scale mét thật — cần 2 cờ này, xem mục 9). Sau khi bật đúng 2 cờ
+đó (bắt buộc cho mọi dữ liệu DA3, không phải tính năng riêng của mục này), tường đúng đã được chọn
+kể cả khi `aspect_ratio_weight=0.0` — đã kiểm tra trực tiếp cả 2 giá trị `0.0` và `1.0` cho ra
+CÙNG kết quả. Vậy nguyên nhân lỗi ban đầu là thiếu chuẩn hóa scale, không phải thiếu tín hiệu
+aspect-ratio — cơ chế này chưa có bằng chứng thật nào chứng minh nó cần thiết.
+
+**Giữ lại vì:** hạ tầng đúng, không đổi hành vi khi tắt (mặc định `0.0`), 0 regression trên toàn
+bộ dataset cũ, 32/32 test pass — là một cơ chế phòng ngừa hợp lý (2 tường có khoảng cách object
+GẦN GIỐNG nhau NHƯNG kích thước khác hẳn là tình huống có thể xảy ra ở dataset khác), nhưng
+**không** trình bày như một kết quả đã kiểm chứng khi viết bài — chỉ nên nhắc là cơ chế đã cài đặt
+sẵn, chưa có dữ liệu thật nào cần đến nó.
+
+---
+
+## 11. Ước lượng gravity từ ma trận xoay camera + pipeline gravity-locked cho dữ liệu có camera pose ✅
+
+**File:** `src/sgd_alignment/detection/plane_fitting.py` (`estimate_up_vector_from_camera_rotation`),
+`src/sgd_alignment/matching/gravity_align.py`, `src/sgd_alignment/matching/robust_align.py`
+(merge có chọn lọc từ nhánh thử nghiệm của cộng sự — QuangMinhPham), `scripts/align_gravity_pipeline.py`
+
+**Ước lượng "lên" tốt hơn:** thay vì PCA trên vị trí camera (`estimate_up_vector_from_camera_trajectory`,
+cần nhiều vị trí trải rộng, suy biến khi ít view), lấy trung bình hướng "lên" trực tiếp từ CHÍNH ma
+trận xoay mỗi khung hình (`up = -R[1,:]`) — ổn định hơn (hoạt động cả với 1 frame), có sẵn chỉ số
+tin cậy `up_consistency`. Đã trở thành mặc định cho toàn bộ pipeline (`multiview_pipeline.py`,
+`compare_baseline_vs_rga.py`) — cải thiện residual trên `q1` (0.0396→0.0239) và **tự sửa luôn** bug
+tường-hốc-lõm ở `chua_thay` (mục kế tiếp) mà không cần thêm cơ chế nào khác.
+
+**Pipeline gravity-locked (`gravity_align.py`/`robust_align.py`):** thay vì dò tường toàn cảnh
+(`extract_wall_planes`) để xác định pháp tuyến, tính pháp tuyến **riêng từng cụm điểm cửa** (PCA cục
+bộ, sign-invariant), khóa gravity qua ma trận xoay camera, và dùng vị trí camera để xác nhận 2 phía
+đối diện tường. Đã chứng minh **thắng rõ rệt** so với pipeline gốc trên `chua_thay` (kiến trúc chùa,
+cửa cánh không chuẩn) — pipeline gốc bị bug tường-hốc-lõm ở cửa sổ có độ sâu (RANSAC tách 1 mặt
+tường thật thành nhiều mặt phẳng ứng viên gần nhau, sai hướng); pipeline gravity không phụ thuộc dò
+tường toàn cảnh nên né hoàn toàn.
+
+**3 bug thật phát hiện và sửa trong lúc merge** (dữ liệu `server`, đã biết ground-truth từ trước —
+`indoor[4]/[5]` mới đúng tường, không phải `indoor[2]/[3]`):
+1. Giả thuyết nhiều-cửa (`_add_multi`) chạy **trộn lẫn category** (A có cả window+door, B chỉ có
+   door) — mọi tổ hợp đủ độ dài đều dính window, bị loại hết → rơi hẳn về nhánh 1-cửa (luôn "khớp
+   hoàn hảo" giả tạo vì 1 điểm luôn fit chính nó). Sửa: nhóm theo category trước khi tạo tổ hợp.
+2. Chỉ thử đúng 1 kích thước tổ hợp (bằng `min(len_a, len_b)`) — ép dùng hết toàn bộ cửa 1 bên, dễ
+   trộn lẫn 2 tường khác nhau. Sửa: thử mọi kích thước từ 2 đến min.
+3. Xếp hạng candidate chỉ dựa **residual trung bình** — 1 cặp rác (gần ngưỡng loại) trộn vào vẫn
+   "qua cửa" nếu các cặp còn lại đủ tốt để kéo trung bình xuống. Sửa: xếp theo SỐ LƯỢNG khớp trước
+   (không bỏ sót bằng chứng thật), thêm ngưỡng lọc theo cặp TỆ NHẤT (không chỉ trung bình) để chặn
+   cặp rác trà trộn.
+
+**Kiểm chứng:** cả `server` và `chua_thay` đều CONFIDENT + đúng ground-truth cùng lúc sau khi sửa cả
+3 bug (trước đó sửa bug 1-2 riêng lẻ vẫn làm cái này đúng cái kia sai). `q1` CONFIDENT đúng, `q2` và
+`310_indoor+h_server` bị flag AMBIGUOUS trung thực (dữ liệu tự nó kém ổn định/đối xứng thật, không
+phải bug). 35/35 test cũ vẫn pass.
+
+**Giới hạn phạm vi:** chỉ áp dụng cho dữ liệu CloudCompare có camera pose (`results.npz`) — dataset
+LiDAR thuần (`sc1/sc2_room*`, `vkist`) không có camera pose nên vẫn dùng pipeline gốc
+(`align_indoor_outdoor`), không đổi. Luồng auto-detect (`video1`, `meeting_room`, `Q815`) cũng chưa
+chuyển sang pipeline này (cần cụm điểm thô, hiện chỉ lưu `Detection3D` đã trừu tượng hóa).
+
+---
+
 ## Bảng tổng hợp dataset đã regression-test (sau toàn bộ thay đổi C1–C7)
 
 | Dataset | Nguồn | Match | Residual |

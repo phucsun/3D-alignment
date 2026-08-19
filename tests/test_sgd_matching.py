@@ -4,7 +4,9 @@ import pytest
 from sgd_alignment.common.types import Detection3D
 from sgd_alignment.matching.alignment import (
     align_indoor_outdoor,
+    align_rooms_to_hub,
     estimate_rigid_transform,
+    group_by_wall,
     ransac_match_with_wall_consensus,
     refine_matches_with_geometric_consensus,
     transform_points,
@@ -603,3 +605,114 @@ def test_align_indoor_outdoor_region_label_resolves_symmetric_ambiguity():
     assert outdoor_idx == 1  # the "correct" (wing_A) detection, not the wing_B decoy
     assert np.allclose(result.R, R_true, atol=1e-6)
     assert np.allclose(result.t, t_true, atol=1e-6)
+
+
+def test_group_by_wall_separates_opposite_facing_normals():
+    """A corridor's 2 facing walls have near-antiparallel normals despite
+    being physically close - grouping by `abs(dot)` (as an earlier,
+    buggy version of `plane_fitting.merge_coplanar_planes` did for actual
+    wall planes) would wrongly fuse them. `group_by_wall` must use signed
+    dot so openings on opposite walls end up in different groups even
+    though their normals are nearly parallel in the ABS sense.
+    """
+    same_wall_a = _make_detection("door", np.array([0.0, 0.0, 0.0]), 0.9, 2.1)
+    same_wall_b = _make_detection("door", np.array([1.0, 0.0, 0.0]), 0.9, 2.1)
+    opposite_wall = _make_detection("door", np.array([0.0, 5.0, 0.0]), 0.9, 2.1)
+    opposite_wall.normal[:] = -same_wall_a.normal  # near-antiparallel, not same wall
+    opposite_wall.u_axis[:] = np.cross(opposite_wall.v_axis, opposite_wall.normal)
+
+    groups = group_by_wall([same_wall_a, same_wall_b, opposite_wall])
+    groups_as_sets = [set(g) for g in groups]
+    assert {0, 1} in groups_as_sets  # same_wall_a/b grouped together
+    assert {2} in groups_as_sets  # opposite_wall kept separate
+
+
+def test_align_rooms_to_hub_assigns_rooms_to_correct_walls_by_total_cost():
+    """Mirrors the real `310_indoor`/`server`/`h_server` bug: 2 rooms each
+    open onto the SAME hallway via 2 different physical walls. Naive
+    independent-per-room matching (each room run alone against the full
+    hub set) was confirmed on real data to be able to produce results
+    that are each internally self-consistent yet globally wrong, because
+    neither run has visibility into what the other room needs.
+    `align_rooms_to_hub` must resolve this with a proper minimum-total-cost
+    assignment: both rooms have their own opening spacing designed to
+    fit BOTH hub walls somewhat, but only one specific (room, wall)
+    pairing per room is the true low-cost match.
+    """
+    # hub: wall A openings 1.0 apart (normal +x), wall B openings 3.0 apart
+    # (normal -x, physically the opposite side of the corridor)
+    hub = [
+        _make_detection("door", np.array([0.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 1.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 0.0, 5.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 3.0, 5.0]), 0.9, 2.1),
+    ]
+    for d in hub[2:]:
+        d.normal[:] = -hub[0].normal
+        d.u_axis[:] = np.cross(d.v_axis, d.normal)
+
+    # room "310": own openings 1.05 apart -> clearly fits hub wall A (1.0) far
+    # better than wall B (3.0)
+    room_310 = [
+        _make_detection("door", np.array([10.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([10.0, 1.05, 0.0]), 0.9, 2.1),
+    ]
+    # room "server": own openings 3.1 apart -> clearly fits hub wall B (3.0)
+    # far better than wall A (1.0)
+    room_server = [
+        _make_detection("door", np.array([-10.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([-10.0, 3.1, 0.0]), 0.9, 2.1),
+    ]
+
+    wall_groups = group_by_wall(hub)
+    assert len(wall_groups) == 2
+    wall_a_group, wall_b_group = wall_groups
+
+    assignments = align_rooms_to_hub(
+        [room_310, room_server], hub, estimate_scale=True, normalize_distance=True,
+    )
+
+    assert len(assignments) == 2
+    assert all(a is not None for a in assignments)
+    room_310_assignment, room_server_assignment = assignments
+    assert set(room_310_assignment.wall_hub_indices) == set(wall_a_group)
+    assert set(room_server_assignment.wall_hub_indices) == set(wall_b_group)
+    assert room_310_assignment.result.residuals.max() < 0.5
+    assert room_server_assignment.result.residuals.max() < 0.5
+
+
+def test_align_rooms_to_hub_never_assigns_two_rooms_to_the_same_wall():
+    """Even when both rooms' own naive per-wall preference (evaluated in
+    isolation) would point at the SAME wall, `align_rooms_to_hub` must
+    still produce a valid one-to-one assignment (no double-booking) -
+    the defining guarantee of the Hungarian assignment step, independent
+    of the exact cost values.
+    """
+    hub = [
+        _make_detection("door", np.array([0.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 1.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 0.0, 5.0]), 0.9, 2.1),
+        _make_detection("door", np.array([0.0, 1.05, 5.0]), 0.9, 2.1),
+    ]
+    for d in hub[2:]:
+        d.normal[:] = -hub[0].normal
+        d.u_axis[:] = np.cross(d.v_axis, d.normal)
+
+    # both rooms have near-identical spacing (~1.0-1.02) - each would
+    # independently "prefer" whichever wall is tried, since both walls
+    # are almost equally good (1.0 vs 1.05 apart)
+    room_a = [
+        _make_detection("door", np.array([10.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([10.0, 1.0, 0.0]), 0.9, 2.1),
+    ]
+    room_b = [
+        _make_detection("door", np.array([-10.0, 0.0, 0.0]), 0.9, 2.1),
+        _make_detection("door", np.array([-10.0, 1.02, 0.0]), 0.9, 2.1),
+    ]
+
+    assignments = align_rooms_to_hub([room_a, room_b], hub, estimate_scale=True, normalize_distance=True)
+    assert len(assignments) == 2
+    assert all(a is not None for a in assignments)
+
+    used_wall_groups = [tuple(sorted(a.wall_hub_indices)) for a in assignments]
+    assert used_wall_groups[0] != used_wall_groups[1]  # no double-booking

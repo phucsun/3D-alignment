@@ -1,6 +1,6 @@
 source:
   backend: da3
-  npz_path: data/video1_v1/results.npz
+  npz_path: data/vkist_308/video1_v1/results.npz
 
 selected_views: []
 is_outdoor: true

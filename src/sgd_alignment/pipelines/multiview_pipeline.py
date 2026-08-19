@@ -153,7 +153,7 @@ def run_pipeline(config: MultiviewPipelineConfig, segmenter=None) -> list[Detect
     """
     from sgd_alignment.common.types import PointCloud
     from sgd_alignment.detection.multiview_segmentation import backproject_instances, detections_from_clusters, merge_instances
-    from sgd_alignment.detection.plane_fitting import estimate_up_vector_manhattan
+    from sgd_alignment.detection.plane_fitting import estimate_up_vector_from_camera_rotation, estimate_up_vector_manhattan
 
     source = _build_source(config.source)
     view_ids = _resolve_view_ids(source, config)
@@ -195,14 +195,37 @@ def run_pipeline(config: MultiviewPipelineConfig, segmenter=None) -> list[Detect
     scene_points = scene_points * config.scale
     log.info("scene point cloud: %d points", len(scene_points))
 
+    camera_positions = np.array([-source.pose(v).R.T @ source.pose(v).t for v in view_ids])
+    camera_rotations = np.array([source.pose(v).R for v in view_ids])
+
+    MIN_UP_CONSISTENCY = 0.90
+
     if config.up is not None:
         up = np.array(config.up)
         log.info("up vector (overridden via config): %s", np.round(up, 4))
     else:
-        up = estimate_up_vector_manhattan(PointCloud(points=scene_points))
-        log.info("up vector (auto-estimated): %s", np.round(up, 4))
+        # gravity from each frame's own camera ROTATION (see
+        # estimate_up_vector_from_camera_rotation's docstring) - confirmed
+        # on real data more reliable than the trajectory-position-PCA
+        # version it replaces (works from any number of frames, not just
+        # well-spread ones, and comes with an honest per-capture
+        # consistency score). Falls back to the point-cloud heuristic only
+        # when that consistency is low (a rolling/tilted rig, or a source
+        # with degenerate/duplicated poses) - the rotation estimate itself
+        # never "fails" the way trajectory-PCA could, but a low-consistency
+        # result should not be trusted blindly either.
+        up, consistency = estimate_up_vector_from_camera_rotation(camera_rotations)
+        if consistency >= MIN_UP_CONSISTENCY:
+            log.info("up vector (from camera rotation, consistency=%.3f): %s", consistency, np.round(up, 4))
+        else:
+            log.info("camera-rotation up consistency too low (%.3f < %.2f) - falling back to point-cloud heuristic",
+                      consistency, MIN_UP_CONSISTENCY)
+            up = estimate_up_vector_manhattan(PointCloud(points=scene_points))
+            log.info("up vector (auto-estimated): %s", np.round(up, 4))
+
     detections = detections_from_clusters(scene_points, merged, config.is_outdoor, up=up,
-                                           trim_percentile=config.trim_percentile)
+                                           trim_percentile=config.trim_percentile,
+                                           camera_positions=camera_positions)
 
     detections_path = output_dir / f"{config.output_name}_detections.pkl"
     with open(detections_path, "wb") as f:

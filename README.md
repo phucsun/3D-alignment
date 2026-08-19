@@ -23,8 +23,8 @@ không cần notebook.
 src/sgd_alignment/
 ├── common/types.py              # PointCloud, Detection3D, Plane
 ├── detection/
-│   ├── plane_fitting.py         # RANSAC tìm mặt tường + trục "lên"
-│   ├── opening_geometry.py      # đo width/height/normal của 1 cửa/sổ
+│   ├── plane_fitting.py         # RANSAC tìm mặt tường + trục "lên" (kể cả từ camera pose)
+│   ├── opening_geometry.py      # đo width/height/normal của 1 cửa/sổ, hướng tường ra ngoài
 │   ├── manual_segmentation.py   # đọc dữ liệu CloudCompare (quét tay)
 │   ├── multiview_source.py      # đọc pose/depth từ COLMAP hoặc DA3
 │   ├── multiview_segmentation.py# backproject 2D->3D, gộp instance
@@ -39,6 +39,10 @@ src/sgd_alignment/
 configs/
 ├── multiview_pipeline.example.yaml   # config mẫu cho bước detection
 └── align_pipeline.example.yaml       # config mẫu cho bước align
+
+scripts/
+├── compare_baseline_vs_rga.py   # chạy + so sánh baseline gốc vs RGA đầy đủ trên mọi dataset đã đăng ký
+└── pick_points.py                # tiện ích chọn điểm tay
 
 tests/    # pytest, không cần dữ liệu thật
 ```
@@ -209,6 +213,75 @@ open -a CloudCompare "outputs/<ten_scene>/aligned.ply"
 python -m pytest tests/ -q
 ```
 
-30 test hiện có bao phủ: đọc COLMAP/DA3, backproject 2D→3D, gộp instance, SGD
-matching, Kabsch/Umeyama alignment (kể cả trường hợp lệch scale) — chạy nhanh
-(<15s), không cần dữ liệu thật hay GPU.
+32 test không cần dữ liệu thật bao phủ: đọc COLMAP/DA3, backproject 2D→3D, gộp
+instance, SGD matching, Kabsch/Umeyama alignment (kể cả trường hợp lệch scale)
+— chạy nhanh (<15s), không cần GPU. (10 test khác trong `test_plane_fitting.py`
+/`test_point_cloud_utils.py`/`test_laser_image.py` cần bộ dataset ngoài
+`Indoor-Outdoor-Point-Cloud-Dataset-main/` không đi kèm repo — bỏ qua nếu
+không có bộ đó, không phải lỗi do code.)
+
+---
+
+## 9. Luồng dữ liệu CloudCompare (quét tay) + camera pose
+
+Với dữ liệu quét tay bằng CloudCompare (mục 1, cách 1) mà **có kèm camera
+pose** (file `results.npz` xuất từ DA3/COLMAP cho cả 2 phía — không bắt buộc,
+nhưng nên có nếu có sẵn), `load_manual_segmentation` dùng camera pose làm tín
+hiệu chính cho 2 việc, đáng tin cậy hơn hẳn so với chỉ dùng hình học đám mây
+điểm:
+
+- **Trục "lên"**: PCA trên quỹ đạo camera (trục có phương sai nhỏ nhất) thay
+  vì RANSAC mặt tường — ổn định hơn với video quay ngắn/không đủ góc.
+- **Hướng tường ra ngoài**: so vị trí camera với mặt phẳng tường (sự thật vật
+  lý cứng — máy quay ở phía nào thì chắc chắn ở phía đó) thay vì chỉ đếm mật
+  độ điểm 2 bên (có thể gần như 50/50 với 1 số tường cụ thể dù các tường khác
+  trong cùng scene rất rõ ràng).
+
+```python
+from sgd_alignment.detection.multiview_source import DA3Source
+from sgd_alignment.detection.manual_segmentation import load_manual_segmentation
+import numpy as np
+
+def camera_positions(npz_path):
+    src = DA3Source(npz_path)
+    return np.array([-src.pose(v).R.T @ src.pose(v).t for v in src.view_ids])
+
+cam_in, cam_out = camera_positions("indoor/results.npz"), camera_positions("outdoor/results.npz")
+indoor = load_manual_segmentation("indoor.ply", is_outdoor=False, camera_positions=cam_in)
+outdoor = load_manual_segmentation("outdoor.ply", is_outdoor=True, camera_positions=cam_out)
+```
+
+Không có `results.npz`: bỏ tham số `camera_positions` — hành vi giữ nguyên
+như trước (chỉ dùng hình học đám mây điểm), không cần đổi gì khác.
+
+**`PairWeights.aspect_ratio_weight`** (mặc định `0.0`, tắt): về lý thuyết, khi
+2 bức tường có khoảng cách giữa các cửa/sổ tình cờ gần giống nhau, chỉ riêng
+đặc trưng quan hệ (khoảng cách/góc) có thể chọn nhầm tường — bật trọng số này
+cộng thêm chênh lệch tỉ lệ rộng/cao (width/height, không phụ thuộc scale) của
+chính từng cửa/sổ vào cost để giúp phân biệt. **Lưu ý:** cơ chế đã cài đặt và
+test đơn vị đầy đủ, nhưng **chưa có bằng chứng dữ liệu thật nào cần đến nó**
+— trường hợp `server` từng tưởng cần trọng số này thực ra là do thiếu
+`estimate_scale`/`normalize_distance` (xem mục 9 và `CONTRIBUTIONS.md` mục
+10); sau khi bật đúng 2 cờ đó, `aspect_ratio_weight=0.0` và `=1.0` cho kết
+quả giống hệt nhau trên mọi dataset đã có.
+
+```python
+from sgd_alignment.matching.alignment import align_indoor_outdoor
+from sgd_alignment.matching.sgd import PairWeights
+
+result = align_indoor_outdoor(indoor, outdoor, weights=PairWeights(aspect_ratio_weight=1.0))
+```
+
+### Tái tạo kết quả đã có sẵn (mọi dataset đã đăng ký, 1 lệnh)
+
+```bash
+python scripts/compare_baseline_vs_rga.py
+```
+
+Chạy và in ra số cặp khớp + residual cho **baseline** (Hungarian thuần, đúng
+bài gốc Yang et al.) và **RGA** (đầy đủ các cải tiến) trên mọi dataset đã
+đăng ký trong `DATASETS` (đầu file `scripts/compare_baseline_vs_rga.py`) —
+gồm cả các bộ CloudCompare thường và các bộ có camera pose (`q1`, `q2`,
+`server`). Thêm dataset mới bằng cách thêm 1 `DatasetEntry` — dùng
+`_load_cloudcompare` (không camera pose) hoặc
+`_load_cloudcompare_with_camera_pose` (có `results.npz`).

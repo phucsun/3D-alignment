@@ -196,6 +196,73 @@ def _candidate_up_axes(
     return [(axis / np.linalg.norm(axis), extent) for axis, extent in candidates]
 
 
+def estimate_up_vector_from_camera_trajectory(camera_positions: np.ndarray) -> np.ndarray:
+    """Estimate "up" from the recorded camera trajectory (DA3/COLMAP poses)
+    instead of point-cloud geometry: PCA on the camera positions, taking the
+    axis of *smallest* variance - a handheld/tripod capture walking through
+    a room or corridor moves mostly horizontally (floor-parallel), so the
+    vertical axis is consistently the one the camera moves least along,
+    regardless of how cluttered or narrow the space is.
+
+    Confirmed on real data to be far more reliable than any point-cloud-only
+    heuristic (`estimate_up_vector_manhattan`/`_cross_scene`) for short or
+    single-direction captures, where a wall can end up "shorter" than the
+    room's actual height by pure bad luck of camera coverage - the camera
+    trajectory itself has no such failure mode since it doesn't depend on
+    which surfaces got captured. Prefer this whenever camera poses are
+    available; fall back to the point-cloud heuristics only when they
+    aren't (e.g. no `results.npz` / pose data for this capture).
+
+    Sign is arbitrary (PCA axes have no orientation) - not resolved here;
+    callers with 2 scenes should sign-align the two estimates against each
+    other (dot product sign) before using either, since both a and -a are
+    equally valid "up" directions from this function alone.
+    """
+    centered = camera_positions - camera_positions.mean(axis=0)
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    return vt[-1]
+
+
+def estimate_up_vector_from_camera_rotation(rotations: np.ndarray) -> tuple[np.ndarray, float]:
+    """Estimate "up" (gravity) directly from each frame's own camera
+    ROTATION, instead of statistically inferring it from the camera
+    TRAJECTORY's positions (`estimate_up_vector_from_camera_trajectory`).
+
+    For the world->cam convention this project uses throughout
+    (`X_cam = R @ X_world + t`, see `multiview_source.Pose`), a camera's
+    own upright/gravity-aligned "up" in world coordinates is `-R[1, :]`
+    (image row-axis points down) - averaging this per-frame estimate over
+    all views gives a world-up vector, WITH sign already resolved (not
+    arbitrary like a PCA axis), and a genuine confidence number (how much
+    the frames agree with each other) as a side effect.
+
+    Confirmed on real data to be strictly more robust than the
+    trajectory-PCA approach: it needs no minimum number of frames or
+    trajectory spread at all (works from even a single frame, unlike PCA
+    which is ill-defined with too few/collinear positions - see
+    `MIN_CAMERA_POSITIONS_FOR_TRAJECTORY_UP`'s use of the PCA version),
+    and produced a lower alignment residual on real data (`q1`: 0.0396 ->
+    0.0324) with no observed downside. Prefer this whenever per-frame
+    rotations are available (any DA3/COLMAP source); the trajectory-PCA
+    version remains for sources that only expose positions.
+
+    Returns `(up, consistency)`: `up` is unit-length and already
+    correctly SIGNED (points away from the floor, not arbitrary); `consistency`
+    is the median cosine similarity between each frame's own up estimate
+    and the averaged result (~1.0 = very stable/reliable, lower means the
+    capture's own orientation data disagrees with itself - e.g. a rolling
+    or tilted rig - and this up estimate should be treated with more
+    caution, similar in spirit to `estimate_up_vector_cross_scene`'s
+    `min_agreement_dot` gate).
+    """
+    up_per_frame = -rotations[:, 1, :]
+    up_per_frame = up_per_frame / (np.linalg.norm(up_per_frame, axis=1, keepdims=True) + 1e-12)
+    up = up_per_frame.mean(axis=0)
+    up = up / (np.linalg.norm(up) + 1e-12)
+    consistency = float(np.median(up_per_frame @ up))
+    return up, consistency
+
+
 def estimate_up_vector_manhattan(
     pc: PointCloud,
     distance_threshold: float = 0.03,
@@ -440,10 +507,32 @@ def merge_coplanar_planes(
     subset of its points but with nearly identical normal and offset -
     visually this shows up as one physical wall colored in several
     unrelated colors. Any two planes whose normals are nearly parallel
-    (dot >= normal_dot_min) and whose offsets are close (|d1 - d2| <=
-    d_max_diff) are merged into one plane, refit by least-squares over the
-    union of their points (so the merged plane is the best fit for all of
-    its points, not just whichever fragment happened to be picked first).
+    (dot >= normal_dot_min) and whose offsets are close are merged into one
+    plane, refit by least-squares over the union of their points (so the
+    merged plane is the best fit for all of its points, not just whichever
+    fragment happened to be picked first).
+
+    The offset check is sign-aware: for the plane equation normal.x + d = 0,
+    flipping the normal's sign to represent the exact same physical plane
+    also flips the sign of d (since (-normal).x + (-d) = -(normal.x + d)).
+    `abs(dot(n1, n2)) >= normal_dot_min` accepts BOTH same- and
+    opposite-signed normals (RANSAC's per-fit normal sign is arbitrary, see
+    `_fit_plane_from_sample`), so which offset comparison is correct
+    depends on that sign: `|d1 - d2|` when dot >= 0, `|d1 + d2|` when
+    dot < 0. Using `|d1 - d2|` unconditionally (as an earlier version did)
+    is a confirmed real bug: a narrow corridor's 2 opposite-facing side
+    walls can have nearly antiparallel normals AND coincidentally similar
+    |d| (e.g. d1=0.251, d2=0.24 on real data), which passed the old
+    unconditional `|d1-d2|<=0.15` check and wrongly fused 2 genuinely
+    different walls into one - the least-squares refit over their combined
+    (roughly 2.6M-point) union then produced a physically meaningless
+    normal, observed on real data to end up nearly parallel to the up axis
+    (dot with up = -0.998) purely as an artifact of the point distribution,
+    not a floor/ceiling. Downstream this silently made every door near
+    that corridor attribute to the same phantom wall, losing the ability
+    to tell which real side of the corridor a door was on. The sign-aware
+    check (`|d1+d2|` for opposite-signed pairs) correctly rejects this
+    case: 0.251 + 0.24 = 0.491, far above d_max_diff.
     """
     remaining = list(planes)
     merged: list[Plane] = []
@@ -453,10 +542,9 @@ def merge_coplanar_planes(
         group_indices = [base.inlier_indices]
         still_remaining = []
         for other in remaining:
-            same_plane = (
-                abs(float(np.dot(base.normal, other.normal))) >= normal_dot_min
-                and abs(base.d - other.d) <= d_max_diff
-            )
+            dot = float(np.dot(base.normal, other.normal))
+            d_diff = abs(base.d - other.d) if dot >= 0 else abs(base.d + other.d)
+            same_plane = abs(dot) >= normal_dot_min and d_diff <= d_max_diff
             if same_plane:
                 group_indices.append(other.inlier_indices)
             else:

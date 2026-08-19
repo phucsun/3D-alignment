@@ -1,0 +1,21 @@
+source:
+  backend: da3
+  npz_path: data/Q815/Q815_outdoor/results.npz
+
+selected_views: []
+is_outdoor: true
+scale: 1.0
+merge_distance: 0.6
+depth_range: [0.05, 30.0]
+
+output_dir: outputs/q815
+output_name: outdoor
+
+segmenter:
+  text_prompt: "door."
+  box_threshold: 0.5
+  text_threshold: 0.25
+  nms_iou_thres: 0.7
+  cross_label_iou_thres: 0.7
+  gdino_model_id: "IDEA-Research/grounding-dino-base"
+  sam_model_id: "sam2.1_b.pt"

@@ -90,6 +90,22 @@ class PairWeights:
     # aspect ratio to still consider 2 isolated objects a candidate match
     intrinsic_aspect_ratio_threshold: float = 0.5
 
+    # own-object aspect ratio (width/height, scale-invariant) term added to
+    # EVERY relational match cost, not just the intrinsic fallback - default
+    # 0.0 (off, exact prior behavior for every already-verified dataset).
+    # Motivation: the relational descriptor (distance/angle/rotation between
+    # neighbors) alone never uses each object's own absolute size, so 2
+    # walls whose *inter-opening spacing* happens to be similar could in
+    # principle be told apart by their doors' own aspect ratio instead. NOT
+    # currently backed by a confirmed real-data case: an initial `server`
+    # finding attributed to this term turned out, on closer check, to be
+    # caused by a missing `estimate_scale`/`normalize_distance` for that
+    # (DA3-reconstructed, not metric-LiDAR) dataset - once those are set
+    # correctly the wrong-wall selection resolves on relational cost alone,
+    # with this weight at 0.0 or 1.0 giving identical output. See
+    # CONTRIBUTIONS.md section 10 for the full retraction writeup.
+    aspect_ratio_weight: float = 0.0
+
     @property
     def angle_weights(self) -> np.ndarray:
         return np.array([self.alpha_weight, self.beta_weight, self.theta_weight])
@@ -283,6 +299,19 @@ def _regions_compatible(a: Detection3D, b: Detection3D) -> bool:
     return a.region is None or b.region is None or a.region == b.region
 
 
+def _aspect_ratio_diff(a: Detection3D, b: Detection3D) -> float:
+    """Relative difference in width/height aspect ratio between 2
+    detections' own absolute geometry - scale-invariant (works whether or
+    not indoor/outdoor share a metric scale, see `build_sgds`'s
+    `normalize_distance`), shared by `_intrinsic_cost` and the optional
+    `PairWeights.aspect_ratio_weight` term in `sgdu_distance`.
+    """
+    if a.height < 1e-9 or b.height < 1e-9:
+        return float("inf")
+    aspect_a, aspect_b = a.width / a.height, b.width / b.height
+    return abs(aspect_a - aspect_b) / max(aspect_a, aspect_b, 1e-9)
+
+
 def _intrinsic_cost(a: Detection3D, b: Detection3D, weights: PairWeights) -> float:
     """Cost between 2 detections using only each one's OWN absolute
     geometric properties - no relation to other objects in the scene.
@@ -299,17 +328,10 @@ def _intrinsic_cost(a: Detection3D, b: Detection3D, weights: PairWeights) -> flo
     dimensions - width, height, thickness - so it isn't rotationally
     symmetric); the missing piece was ever proposing that single match in
     the first place.
-
-    Compares width/height aspect ratio (scale-invariant - indoor/outdoor
-    may not share a metric scale yet at matching time, see
-    `sgd.build_sgds`'s `normalize_distance`), not absolute size.
     """
     if a.category != b.category or not _regions_compatible(a, b):
         return INFEASIBLE
-    if a.height < 1e-9 or b.height < 1e-9:
-        return INFEASIBLE
-    aspect_a, aspect_b = a.width / a.height, b.width / b.height
-    relative_diff = abs(aspect_a - aspect_b) / max(aspect_a, aspect_b, 1e-9)
+    relative_diff = _aspect_ratio_diff(a, b)
     if relative_diff > weights.intrinsic_aspect_ratio_threshold:
         return INFEASIBLE
     return relative_diff
@@ -333,6 +355,15 @@ def sgdu_distance(
     when both objects merely fail the normal relational comparison
     (wrong geometry is still wrong geometry; the fallback only kicks in
     when the relational comparison had literally nothing to compare).
+
+    `weights.aspect_ratio_weight` (0.0 by default - exact prior behavior):
+    when positive, adds each object's OWN width/height aspect-ratio
+    difference on top of the relational (distance/angle/rotation) cost - see
+    `PairWeights.aspect_ratio_weight`'s docstring for the motivation and an
+    honest note that it is not yet backed by a confirmed real-data case.
+    Only added when the relational cost is finite (an already-infeasible
+    pair - wrong category, over threshold - stays infeasible; this term
+    never makes a rejected pair feasible again).
     """
     if a.detection.category != b.detection.category or not _regions_compatible(a.detection, b.detection):
         return INFEASIBLE, 0
@@ -342,7 +373,10 @@ def sgdu_distance(
         return _intrinsic_cost(a.detection, b.detection, weights), 0
 
     cost = np.array([[_pair_feature_cost(fa, fb, weights) for fb in b.neighbors] for fa in a.neighbors])
-    return _assign_rectangular(cost)
+    relational_cost, num_matched = _assign_rectangular(cost)
+    if weights.aspect_ratio_weight > 0 and np.isfinite(relational_cost):
+        relational_cost += weights.aspect_ratio_weight * _aspect_ratio_diff(a.detection, b.detection)
+    return relational_cost, num_matched
 
 
 def _ambiguity_ratio(costs: np.ndarray, chosen_idx: int) -> float | None:

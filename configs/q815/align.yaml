@@ -1,0 +1,12 @@
+indoor_detections: outputs/q815/indoor_detections.pkl
+indoor_scene_ply: outputs/q815/indoor_scene.ply
+outdoor_detections: outputs/q815/outdoor_detections.pkl
+outdoor_scene_ply: outputs/q815/outdoor_scene.ply
+
+output_dir: outputs/q815
+output_name: aligned
+
+estimate_scale: true
+normalize_distance: true
+
+max_cost: 5.0

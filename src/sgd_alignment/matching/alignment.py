@@ -19,6 +19,7 @@ import numpy as np
 from scipy.optimize import linear_sum_assignment
 
 from sgd_alignment.common.types import Detection3D
+from sgd_alignment.detection.opening_geometry import aggregate_oriented_wall_normal
 from sgd_alignment.matching.sgd import INFEASIBLE, PairWeights, SGD, _LARGE_FINITE_COST, build_sgds, match_sgds
 
 
@@ -333,6 +334,7 @@ def ransac_match_with_wall_consensus(
         all_samples = [all_samples[i] for i in chosen]
 
     best_inliers: list[tuple[int, int, float]] = []
+    best_inlier_residual_sum = float("inf")
     best_R, best_t = None, None
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")  # a degenerate minimal sample just scores poorly, no need to warn per-hypothesis
@@ -347,8 +349,26 @@ def ransac_match_with_wall_consensus(
             inliers = _reassign_by_geometric_residual(
                 indoor_detections, outdoor_detections, R, t, max_residual, normal_angle_threshold,
             )
-            if len(inliers) > len(best_inliers):
+            # Tie-break on total residual, not just insertion order: 2
+            # genuinely different candidate walls in the same scene (e.g. 2
+            # separate doors into the same corridor from different rooms)
+            # can each attract exactly their own seed pair and nothing else
+            # - an honest tie in inlier count with no cross-voting either
+            # way. Confirmed on real data (`server`): the higher-cost wall
+            # was silently kept every time solely because its 2-match seed
+            # happened to be enumerated first in `combinations()`, even
+            # though the other wall's seed fit with a much lower residual
+            # (and a much lower independent SGD relational cost - see
+            # CONTRIBUTIONS.md). Preferring the lower total residual on a
+            # tie is a well-defined, order-independent choice; it never
+            # overrides a hypothesis with strictly more support.
+            inlier_residual_sum = sum(residual for _, _, residual in inliers)
+            better = len(inliers) > len(best_inliers) or (
+                len(inliers) == len(best_inliers) and inlier_residual_sum < best_inlier_residual_sum
+            )
+            if better:
                 best_inliers, best_R, best_t = inliers, R, t
+                best_inlier_residual_sum = inlier_residual_sum
 
     if not best_inliers:
         return matches, None, None
@@ -500,3 +520,253 @@ def align_indoor_outdoor(
     center_dst = np.array([outdoor_detections[j].center for _, j, _ in matches])
     residuals = np.linalg.norm(transform_points(center_src, R, t) - center_dst, axis=1)
     return AlignmentResult(R=R, t=t, matches=matches, residuals=residuals, scale=scale)
+
+
+def group_by_wall(detections: list[Detection3D], same_wall_dot: float = 0.9) -> list[list[int]]:
+    """Group opening detections by which physical wall they're on, using
+    each detection's own already-resolved `.normal` (see
+    `opening_geometry.points_to_detection`) - no new geometry computed
+    here, just a greedy clustering of the normals openings already carry.
+
+    `same_wall_dot`: two detections are on the same wall when their
+    normals agree with dot >= this (same DIRECTION, not just parallel -
+    deliberately not `abs(dot)`). 2 openings on *opposite* walls of a
+    corridor/room (facing away from each other into 2 different spaces)
+    have near-antiparallel normals despite being physically close; folding
+    them into one group here would repeat the exact sign-unaware mistake
+    `plane_fitting.merge_coplanar_planes` had before its fix (see that
+    function's docstring) - direction matters, magnitude of the angle
+    alone does not.
+    """
+    groups: list[list[int]] = []
+    for idx, d in enumerate(detections):
+        for group in groups:
+            if float(np.dot(d.normal, detections[group[0]].normal)) >= same_wall_dot:
+                group.append(idx)
+                break
+        else:
+            groups.append([idx])
+    return groups
+
+
+@dataclass
+class RoomAssignment:
+    wall_hub_indices: list[int]  # indices into the original hub_detections list
+    result: AlignmentResult  # result.matches' outdoor indices are LOCAL to wall_hub_indices
+
+
+def align_rooms_to_hub(
+    rooms: list[list[Detection3D]],
+    hub_detections: list[Detection3D],
+    **align_kwargs,
+) -> list[RoomAssignment | None]:
+    """Align several "room" detection sets to one shared "hub" scene (e.g.
+    N rooms each opening onto a single hallway/corridor) - the star
+    topology where every room borders the hub but not each other.
+
+    Confirmed on real data that simply calling `align_indoor_outdoor`
+    once per room independently, each against the hub's FULL detection
+    list, can silently produce a result that is internally consistent
+    (low residual, passes its own same-side check) for EVERY room on its
+    own, yet globally wrong once combined: 2 rooms' own least-cost wall
+    can point at the very same physical wall, and whichever room's SGD
+    relational cost happened to look good enough on that shared wall
+    "wins" it in its own isolated run - with no way for either run to
+    know a second room was competing for the same slot, since
+    `align_indoor_outdoor`'s contract is exactly one indoor/outdoor pair
+    at a time. This is not a bug in that function; it is a genuinely
+    different problem (assigning WHICH wall belongs to WHICH room) that
+    only a caller with visibility into every room at once can solve.
+
+    Approach: group `hub_detections` by wall (`group_by_wall`), then try
+    every (room, wall) combination through `align_indoor_outdoor`
+    restricted to that one wall's detections, recording the mean matched
+    SGD cost as that combination's price (`inf` where matching fails
+    outright - wrong category, no feasible pair, etc). One Hungarian
+    assignment (`scipy.optimize.linear_sum_assignment`) over the resulting
+    (room x wall) cost matrix then picks the total-cost-minimizing,
+    no-two-rooms-share-a-wall assignment - the same underlying algorithm
+    `sgd.py` already uses for opening-to-opening matching, just applied
+    one level up, at room-to-wall granularity. Passing each room's FULL
+    detection list (not pre-filtered) to every trial also resolves a
+    related real issue for free: a room with its own internal decoy
+    opening set (e.g. `server`'s 2nd, unrelated door pair on a different
+    internal wall - see CONTRIBUTIONS.md) naturally loses on cost to
+    whichever of its own opening subsets truly fits a given hub wall, once
+    each hub wall is tried in isolation rather than the decoy being able
+    to "steal" a hub wall slot in one single whole-hub Hungarian pass.
+
+    `**align_kwargs`: forwarded to every `align_indoor_outdoor` call
+    (e.g. `estimate_scale=True, normalize_distance=True,
+    use_ransac_consensus=True, use_intrinsic_fallback=True`).
+
+    Returns one `RoomAssignment | None` per room, in `rooms`'s order -
+    `None` for a room left unassigned if there are more rooms than walls.
+    """
+    wall_groups = group_by_wall(hub_detections)
+    n_rooms, n_walls = len(rooms), len(wall_groups)
+
+    cost = np.full((n_rooms, n_walls), np.inf)
+    cached: dict[tuple[int, int], AlignmentResult] = {}
+    for r, room in enumerate(rooms):
+        for w, group in enumerate(wall_groups):
+            sub_hub = [hub_detections[i] for i in group]
+            try:
+                result = align_indoor_outdoor(room, sub_hub, **align_kwargs)
+            except ValueError:
+                continue
+            cached[(r, w)] = result
+            cost[r, w] = float(np.mean([c for _, _, c in result.matches]))
+
+    finite_cost = np.where(np.isfinite(cost), cost, _LARGE_FINITE_COST)
+    row_idx, col_idx = linear_sum_assignment(finite_cost)
+
+    assigned: list[RoomAssignment | None] = [None] * n_rooms
+    for r, w in zip(row_idx, col_idx):
+        if np.isfinite(cost[r, w]):
+            assigned[r] = RoomAssignment(wall_hub_indices=wall_groups[w], result=cached[(r, w)])
+    return assigned
+
+
+def _rotation_between_unit_vectors(source: np.ndarray, target: np.ndarray) -> np.ndarray:
+    """The rotation matrix that maps unit vector `source` onto unit
+    vector `target` (Rodrigues' rotation formula). Falls back to identity
+    (already aligned) or a 180-degree rotation about an arbitrary
+    perpendicular axis (exactly opposite - axis choice doesn't matter for
+    the correction we use this for) when the 2 vectors are degenerate
+    (parallel/antiparallel), since the cross-product axis is undefined
+    there.
+    """
+    source = source / np.linalg.norm(source)
+    target = target / np.linalg.norm(target)
+    v = np.cross(source, target)
+    sin_angle = np.linalg.norm(v)
+    cos_angle = float(np.dot(source, target))
+    if sin_angle < 1e-10:
+        if cos_angle > 0:
+            return np.eye(3)
+        perpendicular = np.array([1.0, 0.0, 0.0]) if abs(source[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
+        axis = np.cross(source, perpendicular)
+        axis = axis / np.linalg.norm(axis)
+        K = np.array([[0, -axis[2], axis[1]], [axis[2], 0, -axis[0]], [-axis[1], axis[0], 0]])
+        return np.eye(3) + 2 * (K @ K)
+    # NOTE: K is built from the RAW cross product `v`, not a unit axis
+    # (v/sin_angle) - this specific "vector-to-vector rotation" identity
+    # requires that (confirmed the bug this fixes: normalizing v before
+    # building K here silently produced a NON-orthogonal "rotation"
+    # matrix, det=1.25 instead of 1.0, which is what corrupted every
+    # real-data test of this function until caught).
+    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    return np.eye(3) + K + K @ K * ((1 - cos_angle) / (sin_angle ** 2))
+
+
+def refine_with_wall_normal_lock(
+    result: AlignmentResult,
+    indoor_detections: list[Detection3D],
+    outdoor_detections: list[Detection3D],
+    indoor_clusters: list[np.ndarray],
+    outdoor_clusters: list[np.ndarray],
+    up_indoor: np.ndarray,
+    up_outdoor: np.ndarray,
+    max_deviation_deg: float = 25.0,
+) -> AlignmentResult:
+    """Tighten an already-computed `align_indoor_outdoor` result so the
+    matched wall's normals become EXACTLY co-directional (`R @ n_indoor
+    == n_outdoor`, empirically confirmed - see the note further down on
+    why this is PARALLEL rather than the antiparallel relationship a
+    naive "2 wall faces point away from each other" intuition suggests).
+    `align_indoor_outdoor` itself only fits the matched openings'
+    8 corners; with few openings (commonly just 1-2 real doors) that fit
+    has little data to average measurement/segmentation noise over, and
+    the residual "hơi lệch" (slightly off) look this leaves is exactly
+    what motivated this refinement (see CONTRIBUTIONS.md).
+
+    Does NOT change which correspondence was chosen (that's
+    `align_indoor_outdoor`/`ransac_match_with_wall_consensus`'s job,
+    already reliable at disambiguating between multiple candidate walls -
+    see CONTRIBUTIONS.md for why this project's own RANSAC-consensus
+    tie-break is kept for that step instead of adopting an alternative
+    matcher). Only adjusts rotation - by a small correction pinned at the
+    matched openings' own centroid, so translation error isn't introduced
+    at the wall itself - and recomputes `t`/`residuals` to match; `scale`
+    is unchanged (rotating by an orthogonal correction doesn't change
+    `R`'s singular values).
+
+    `indoor_detections`/`outdoor_detections`: the same lists `result` was
+    computed from - only used to recompute `residuals` (via their
+    `.center`, exactly like `align_indoor_outdoor` itself does) under the
+    refined transform, and as the SIGN REFERENCE for the matched walls'
+    aggregated normal (see `opening_geometry.aggregate_oriented_wall_normal`)
+    - critical, not cosmetic: an earlier version of this function used
+    the sign-INVARIANT aggregate directly, silently assuming it already
+    pointed "outward" - confirmed on real data that this can be wrong
+    roughly half the time (a bare PCA/eigendecomposition normal has no
+    inherent sign), which made the correction target `-n_outdoor` when
+    the aggregate's arbitrary sign actually meant `+n_outdoor` was
+    correct - a ~180-degree misfire that blew up residuals into the
+    thousands and flipped the alignment to the wrong side. Sign-aligning
+    each side's aggregate to its own `Detection3D.normal` average (already
+    reliably oriented by `orient_walls_outward`) before computing the
+    correction fixes this.
+
+    `indoor_clusters`/`outdoor_clusters`: EVERY opening's raw point
+    cluster for indoor/outdoor respectively (not just the matched ones -
+    the aggregation is given only the matched subset internally), in the
+    same order/indexing as `indoor_detections`/`outdoor_detections` (see
+    `manual_segmentation.load_manual_segmentation`'s `return_points=True`).
+
+    Falls back to returning `result` unchanged (no-op) when either
+    side's aggregated wall normal isn't reliable, or the correction this
+    would apply exceeds `max_deviation_deg` (deliberately NOT using
+    `abs()` on the angle here - see the bug note above; a genuine
+    near-180-degree disagreement must be REJECTED, not silently treated
+    as "0 degrees off" the way comparing unsigned normals would).
+    """
+    matched_indoor_clusters = [indoor_clusters[i] for i, _, _ in result.matches]
+    matched_outdoor_clusters = [outdoor_clusters[j] for _, j, _ in result.matches]
+    matched_indoor_normals = [indoor_detections[i].normal for i, _, _ in result.matches]
+    matched_outdoor_normals = [outdoor_detections[j].normal for _, j, _ in result.matches]
+
+    n_indoor, ok_indoor = aggregate_oriented_wall_normal(matched_indoor_clusters, matched_indoor_normals, up_indoor)
+    n_outdoor, ok_outdoor = aggregate_oriented_wall_normal(matched_outdoor_clusters, matched_outdoor_normals, up_outdoor)
+    if not (ok_indoor and ok_outdoor):
+        return result
+
+    rotation_only = result.R / (float(np.linalg.norm(result.R, axis=0).mean()) + 1e-12)
+    current_direction = rotation_only @ n_indoor
+    current_direction = current_direction / np.linalg.norm(current_direction)
+    # PARALLEL, not antiparallel: confirmed on real data (4 independently
+    # signed-distance-verified datasets - q1, server+h_server,
+    # 310_indoor+h_server, chua_thay) that a correct alignment has
+    # `R @ n_indoor` pointing the SAME way as `n_outdoor`, not opposite -
+    # an earlier version of this function assumed antiparallel (by loose
+    # analogy to 2 wall FACES pointing away from each other) and got
+    # ~178-180 degree "corrections" on every one of those already-correct
+    # cases, which the (also buggy, at the time) deviation check failed to
+    # reject. Both `n_indoor`/`n_outdoor` are sign-aligned to their own
+    # side's already-trusted `Detection3D.normal` convention
+    # (`orient_walls_outward`), so trust that convention's empirical
+    # relationship, not an a priori physical guess.
+    target_direction = n_outdoor / np.linalg.norm(n_outdoor)
+
+    # NOT abs() here - both directions are now correctly signed, so a
+    # genuine large disagreement (near -1, i.e. R@n_indoor pointing
+    # OPPOSITE n_outdoor instead of the same way) must be caught.
+    cos_deviation = float(np.clip(np.dot(current_direction, target_direction), -1.0, 1.0))
+    deviation_deg = float(np.degrees(np.arccos(cos_deviation)))
+    if deviation_deg > max_deviation_deg:
+        return result
+
+    correction = _rotation_between_unit_vectors(current_direction, target_direction)
+
+    pivot = np.array([indoor_clusters[i].mean(axis=0) for i, _, _ in result.matches]).mean(axis=0)
+    pivot_transformed = transform_points(pivot[None, :], result.R, result.t)[0]
+
+    R_final = correction @ result.R
+    t_final = correction @ (result.t - pivot_transformed) + pivot_transformed
+
+    center_src = np.array([indoor_detections[i].center for i, _, _ in result.matches])
+    center_dst = np.array([outdoor_detections[j].center for _, j, _ in result.matches])
+    residuals = np.linalg.norm(transform_points(center_src, R_final, t_final) - center_dst, axis=1)
+    return AlignmentResult(R=R_final, t=t_final, matches=result.matches, residuals=residuals, scale=result.scale)
+

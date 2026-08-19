@@ -17,7 +17,7 @@ from plyfile import PlyData
 
 from sgd_alignment.common.types import Detection3D, PointCloud
 from sgd_alignment.detection.opening_geometry import (
-    nearest_wall_normal,
+    aggregate_oriented_wall_normal,
     orient_walls_outward,
     points_to_detection,
 )
@@ -62,7 +62,9 @@ def load_manual_segmentation(
     is_outdoor: bool,
     up: np.ndarray | None = None,
     camera_positions: np.ndarray | None = None,
-) -> list[Detection3D]:
+    trim_percentile: float = 0.0,
+    return_points: bool = False,
+) -> list[Detection3D] | tuple[list[Detection3D], list[np.ndarray]]:
     """Read a CloudCompare-exported .ply with one `scalar_<name>` column
     per hand-segmented opening and return one Detection3D per opening.
 
@@ -93,6 +95,34 @@ def load_manual_segmentation(
     so just taking the geometrically nearest wall plane is both simpler
     and more reliable - a manually selected window/door cluster is not
     going to be near a furniture surface by coincidence.
+
+    `trim_percentile` (default 0.0, exact prior behavior): forwarded to
+    `points_to_detection` - trims outlier points before measuring
+    width/height. Default is a genuine no-op (see that function's
+    docstring for why manual selections don't usually need it); exposed
+    here as an opt-in for ablation on scenes with noisier hand selections.
+
+    Cross-checks each wall's RANSAC-derived normal against the openings
+    it was assigned (2+ sharing the same nearest wall): aggregating those
+    openings' own per-cluster normals (`opening_geometry.
+    aggregate_oriented_wall_normal`) gives a 2nd, independent estimate
+    that doesn't depend on whole-scene wall-plane detection at all - when
+    it disagrees with the RANSAC wall's normal by more than
+    `wall_normal_agreement_threshold` (same convention as
+    `points_to_detection`'s own per-opening PCA fallback), the aggregated
+    estimate is trusted instead for every opening in that wall's group.
+    Confirmed on real data (`chua_thay`) that a window reveal's inner and
+    outer faces can fragment whole-scene wall detection into several
+    close, inconsistent candidate planes even after the up-vector fix in
+    `plane_fitting.estimate_up_vector_from_camera_rotation`; this
+    aggregation is a 2nd line of defense that doesn't depend on getting
+    the whole-scene wall list right at all.
+
+    `return_points` (default False, exact prior behavior/return type):
+    when True, also returns each opening's own RAW point cluster (the
+    selection before any wall-normal attribution or trimming), one per
+    returned `Detection3D` in the same order - needed by
+    `alignment.refine_with_wall_normal_lock`.
     """
     ply = PlyData.read(str(path))
     vertex = ply["vertex"].data
@@ -103,7 +133,10 @@ def load_manual_segmentation(
     walls = extract_wall_planes(pc, up=scene_up)
     oriented_normals = orient_walls_outward(walls, pc, is_outdoor, camera_positions=camera_positions)
 
-    detections = []
+    # pass 1: collect each opening's own selection + which detected wall
+    # (if any) it's nearest to, without building the Detection3D yet -
+    # grouping by wall needs every opening's cluster gathered first.
+    openings = []  # list of (category, selected_points, wall_index_or_None)
     for field_name in vertex.dtype.names:
         category = _field_category(field_name)
         if category is None:
@@ -112,6 +145,41 @@ def load_manual_segmentation(
         if not np.any(mask):
             continue
         selected = points[mask]
-        wall_normal = nearest_wall_normal(selected.mean(axis=0), walls, oriented_normals)
-        detections.append(points_to_detection(selected, category, scene_up, wall_normal))
+        wall_index = None
+        if walls:
+            centroid = selected.mean(axis=0)
+            best_idx = min(range(len(walls)), key=lambda i: abs(walls[i].signed_distance(centroid[None, :])[0]))
+            if abs(walls[best_idx].signed_distance(centroid[None, :])[0]) <= 0.15:
+                wall_index = best_idx
+        openings.append((category, selected, wall_index))
+
+    # pass 2: for each wall with >=2 openings assigned to it, cross-check
+    # the RANSAC wall normal against the openings' own aggregated normal;
+    # override for that whole group when they disagree.
+    wall_normal_override: dict[int, np.ndarray] = {}
+    wall_normal_agreement_threshold = 0.85
+    groups: dict[int, list[np.ndarray]] = {}
+    for _, selected, wall_index in openings:
+        if wall_index is not None:
+            groups.setdefault(wall_index, []).append(selected)
+    for wall_index, clusters in groups.items():
+        if len(clusters) < 2:
+            continue
+        ransac_normal = oriented_normals[wall_index]
+        aggregate, reliable = aggregate_oriented_wall_normal(clusters, [ransac_normal] * len(clusters), scene_up)
+        if aggregate is None or not reliable:
+            continue
+        if abs(float(np.dot(aggregate, ransac_normal))) < wall_normal_agreement_threshold:
+            wall_normal_override[wall_index] = aggregate
+
+    detections = []
+    for category, selected, wall_index in openings:
+        if wall_index is not None and wall_index in wall_normal_override:
+            wall_normal = wall_normal_override[wall_index]
+        else:
+            wall_normal = oriented_normals[wall_index] if wall_index is not None else None
+        detections.append(points_to_detection(selected, category, scene_up, wall_normal,
+                                               trim_percentile=trim_percentile))
+    if return_points:
+        return detections, [selected for _, selected, _ in openings]
     return detections

@@ -98,12 +98,18 @@ def segment_whole_scene(
     batch_size: int = 32,
     seed: int = 0,
     up: np.ndarray | None = None,
+    rgb: np.ndarray | None = None,
 ) -> np.ndarray:
     """Predict a S3DIS class label for every point in `pc`.
 
-    If `pc` has no intensity, `up` must be given so a verticality-based
-    pseudo-RGB can be used instead of a flat, uninformative gray (see
-    `_verticality_pseudo_rgb`).
+    `rgb` (optional, `(N, 3)` in `[0, 255]`): real per-point color, when
+    available - S3DIS's own inputs are real RGB, so this is what the
+    model actually expects and should give the fairest accuracy read.
+    Takes priority over `pc.intensity`/verticality pseudo-color below.
+
+    If neither `rgb` nor `pc.intensity` is given, `up` must be provided
+    so a verticality-based pseudo-RGB can be used instead of a flat,
+    uninformative gray (see `_verticality_pseudo_rgb`).
 
     Reimplements the block partitioning from the original repo's
     `ScannetDatasetWholeScene` (1m x 1m columns spanning full room height,
@@ -118,11 +124,13 @@ def segment_whole_scene(
     # come out negative or off-scale), which is what caused the earlier
     # nonsense predictions (e.g. "floor" for most of the room).
     xyz = pc.points - pc.points.min(axis=0)
-    if pc.intensity is not None:
+    if rgb is not None:
+        pass
+    elif pc.intensity is not None:
         rgb = _pseudo_rgb(pc)
     else:
         if up is None:
-            raise ValueError("pc has no intensity; pass `up` to use verticality-based pseudo-RGB")
+            raise ValueError("no rgb/pc.intensity given; pass `up` to use verticality-based pseudo-RGB")
         rgb = _verticality_pseudo_rgb(pc, up)
     points = np.concatenate([xyz, rgb], axis=1)  # (N, 6)
 

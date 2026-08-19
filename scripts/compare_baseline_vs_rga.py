@@ -36,6 +36,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from sgd_alignment.common.types import Detection3D  # noqa: E402
 from sgd_alignment.detection.manual_segmentation import load_manual_segmentation  # noqa: E402
+from sgd_alignment.detection.multiview_source import DA3Source  # noqa: E402
+from sgd_alignment.detection.plane_fitting import estimate_up_vector_from_camera_rotation  # noqa: E402
 from sgd_alignment.matching.alignment import align_indoor_outdoor  # noqa: E402
 
 Loader = Callable[[], tuple[list[Detection3D], list[Detection3D]]]
@@ -53,6 +55,48 @@ def _load_cloudcompare(indoor_path: str, outdoor_path: str) -> Loader:
     def _loader():
         indoor = load_manual_segmentation(indoor_path, is_outdoor=False)
         outdoor = load_manual_segmentation(outdoor_path, is_outdoor=True)
+        return indoor, outdoor
+
+    return _loader
+
+
+def _camera_positions(npz_path: str):
+    source = DA3Source(npz_path)
+    return np.array([-source.pose(v).R.T @ source.pose(v).t for v in source.view_ids])
+
+
+def _camera_rotations(npz_path: str):
+    source = DA3Source(npz_path)
+    return np.array([source.pose(v).R for v in source.view_ids])
+
+
+def _load_cloudcompare_with_camera_pose(
+    indoor_path: str, outdoor_path: str, indoor_npz: str, outdoor_npz: str
+) -> Loader:
+    """Same as `_load_cloudcompare`, but for CloudCompare-labeled data
+    sourced from 2 INDEPENDENT DA3/COLMAP reconstructions with recorded
+    camera poses (`results.npz` next to each .ply) - uses gravity from
+    each frame's own camera ROTATION for the shared up-vector (confirmed
+    on real data more reliable than trajectory-position PCA - see
+    `estimate_up_vector_from_camera_rotation`'s docstring, includes a
+    genuine sign, no cross-scene sign-alignment step needed) and camera
+    position for each wall's outward orientation (confirmed on real data
+    to fix a density-based near-tie that silently merged indoor/outdoor
+    onto the same side of the shared wall - see `orient_walls_outward`'s
+    docstring).
+    """
+
+    def _loader():
+        cam_in = _camera_positions(indoor_npz)
+        cam_out = _camera_positions(outdoor_npz)
+        rot_in = _camera_rotations(indoor_npz)
+        rot_out = _camera_rotations(outdoor_npz)
+        up_a, _ = estimate_up_vector_from_camera_rotation(rot_in)
+        up_b, _ = estimate_up_vector_from_camera_rotation(rot_out)
+        up = up_a + up_b
+        up = up / np.linalg.norm(up)
+        indoor = load_manual_segmentation(indoor_path, is_outdoor=False, up=up, camera_positions=cam_in)
+        outdoor = load_manual_segmentation(outdoor_path, is_outdoor=True, up=up, camera_positions=cam_out)
         return indoor, outdoor
 
     return _loader
@@ -161,27 +205,71 @@ DATASETS: list[DatasetEntry] = [
         rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5),
     ),
     DatasetEntry(
-        # only 1 outdoor opening (0 neighbors) - needs intrinsic fallback
-        # (C2) to be matchable at all; baseline intentionally omits it,
-        # since the base paper has no such mechanism.
+        # Has camera pose (results.npz) for both sides - camera-trajectory
+        # up + camera-position wall orientation confirmed correct (opposite
+        # sides of the shared wall) on real data; RANSAC consensus off since
+        # only 2 openings on the noisier side (not enough for a meaningful
+        # consensus vote) but intrinsic fallback still applies.
         "q1",
-        _load_cloudcompare(
-            "data/Q1_indoor/Q1_indoor_points - Cloud.ply",
-            "data/Q1_outdoor/Q1_outdoor_points - Cloud.ply",
+        _load_cloudcompare_with_camera_pose(
+            "data/Q1/Q1_indoor/Q1_indoor_points - Cloud.ply",
+            "data/Q1/Q1_outdoor/Q1_outdoor_points - Cloud.ply",
+            "data/Q1/Q1_indoor/results.npz",
+            "data/Q1/Q1_outdoor/results.npz",
         ),
-        baseline_kwargs={},
-        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
+        baseline_kwargs=dict(estimate_scale=True, normalize_distance=True),
+        rga_kwargs=dict(
+            estimate_scale=True, normalize_distance=True,
+            use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True,
+        ),
     ),
     DatasetEntry(
-        # Q2_outdoor has NO door/window scalar field at all (data not yet
-        # annotated in CloudCompare) - expected to fail until re-annotated.
+        # Has camera pose (results.npz) for both sides - same camera-pose
+        # up/orientation fix as q1, confirmed correct (opposite sides) on
+        # real data; only 1 opening per side so RANSAC consensus never
+        # triggers, but intrinsic fallback still applies.
         "q2",
-        _load_cloudcompare(
-            "data/q2/Q2_indoor/Q2_indoor_points.ply",
-            "data/q2/Q2_outdoor/Q2_outdoor_points.ply",
+        _load_cloudcompare_with_camera_pose(
+            "data/Q2/Q2_indoor/Q2_indoor_points - Cloud.ply",
+            "data/Q2/Q2_outdoor/Q2_outdoor_points - Cloud.ply",
+            "data/Q2/Q2_indoor/results.npz",
+            "data/Q2/Q2_outdoor/results.npz",
         ),
-        baseline_kwargs={},
-        rga_kwargs=dict(use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True),
+        baseline_kwargs=dict(estimate_scale=True, normalize_distance=True),
+        rga_kwargs=dict(
+            estimate_scale=True, normalize_distance=True,
+            use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True,
+        ),
+    ),
+    DatasetEntry(
+        # Has camera pose (results.npz) for both sides. h_server is a
+        # corridor with 2 real opposite-facing walls (one door pair per
+        # neighboring room) plus a 3rd end-of-corridor wall - picking the
+        # wrong wall for `server` here was traced through 2 confirmed real
+        # bugs, not a config issue: (1) `merge_coplanar_planes` wrongly
+        # fused the corridor's 2 opposite walls into one nonsensical plane
+        # (unconditional `|d1-d2|` offset check, not sign-aware for
+        # antiparallel normals - see its docstring), and (2)
+        # `ransac_match_with_wall_consensus` broke ties between 2
+        # candidate walls with equal inlier-vote counts by combination
+        # enumeration order instead of by total residual, silently
+        # preferring the higher-cost wall every time. Both fixed; `server`
+        # now matches its established-correct wall at cost 0.017 (was
+        # 0.12-0.54 depending on config). `aspect_ratio_weight` was never
+        # the real fix - see CONTRIBUTIONS.md section 10 for that
+        # retraction.
+        "server",
+        _load_cloudcompare_with_camera_pose(
+            "data/server/server/server_room_points-segment.ply",
+            "data/server/h_server/h_server_room_points - Cloud - segment.ply",
+            "data/server/server/results.npz",
+            "data/server/h_server/results.npz",
+        ),
+        baseline_kwargs=dict(estimate_scale=True, normalize_distance=True),
+        rga_kwargs=dict(
+            estimate_scale=True, normalize_distance=True,
+            use_ransac_consensus=True, ransac_max_residual=0.5, use_intrinsic_fallback=True,
+        ),
     ),
     DatasetEntry(
         "video1",
