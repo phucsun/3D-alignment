@@ -330,10 +330,17 @@ tường toàn cảnh nên né hoàn toàn.
 `310_indoor+h_server` bị flag AMBIGUOUS trung thực (dữ liệu tự nó kém ổn định/đối xứng thật, không
 phải bug). 35/35 test cũ vẫn pass.
 
-**Giới hạn phạm vi:** chỉ áp dụng cho dữ liệu CloudCompare có camera pose (`results.npz`) — dataset
-LiDAR thuần (`sc1/sc2_room*`, `vkist`) không có camera pose nên vẫn dùng pipeline gốc
-(`align_indoor_outdoor`), không đổi. Luồng auto-detect (`video1`, `meeting_room`, `Q815`) cũng chưa
-chuyển sang pipeline này (cần cụm điểm thô, hiện chỉ lưu `Detection3D` đã trừu tượng hóa).
+**Giới hạn phạm vi:** chỉ áp dụng cho dữ liệu có camera pose (`results.npz`) — dataset LiDAR thuần
+(`sc1/sc2_room*`, `vkist`) không có camera pose nên vẫn dùng pipeline gốc (`align_indoor_outdoor`),
+không đổi.
+
+**Cập nhật (nối luồng auto-detect):** `multiview_pipeline.py` nay lưu thêm `<name>_raw_clusters.pkl`
+(danh sách `OpeningCluster` dựng thẳng từ cụm điểm gộp đa-view Grounding DINO + SAM2, trước khi
+trừu tượng hóa thành `Detection3D`) song song với `<name>_detections.pkl` sẵn có — cho phép
+`align_gravity_camera` chạy được cả trên dữ liệu auto-detect, không chỉ CloudCompare. Đã verify
+trên `Q815` (door-only, không có window thật): residual giảm từ 0.0879 (pipeline gốc, chỉ cảnh báo
+"single wall, no cross-check") xuống 0.0433 (pipeline gravity, status CONFIDENT). `video1`/
+`meeting_room` chưa rerun qua đường mới (không có lỗi gì cần sửa ở 2 dataset đó, chưa ưu tiên).
 
 ---
 
