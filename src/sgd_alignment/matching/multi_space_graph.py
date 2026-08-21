@@ -298,6 +298,7 @@ def resolve_opening_conflict_graph(
     cams: dict,
     max_rounds: int = 6,
     verbose: bool = False,
+    prior_weights: dict[tuple[str, str], float] | None = None,
 ) -> dict[tuple[str, str], OpeningEdge]:
     """Tìm tập cạnh (space, space) KHÔNG dùng lại cửa của nhau, tổng trọng số
     lớn nhất, KHÔNG cần biết trước topology/hub - mỗi vòng: tính lại mọi cạnh
@@ -306,6 +307,14 @@ def resolve_opening_conflict_graph(
 
     `clusters`: {tên không gian: list[OpeningCluster]}.
     `cams`: {tên không gian: CameraEvidence}.
+    `prior_weights`: NHÂN vào trọng số nội tại (`n_matches - residual`) của
+    mỗi candidate TRƯỚC KHI đưa vào MWIS - dùng để tiêm prior tôpô từ Layer 1
+    (VLM/text) NGAY TỪ BƯỚC MWIS, không chỉ downstream cho GNC. Xác nhận
+    thật (docs/multi_space_alignment_plan.md): ở quy mô N≥6 có nhiễu xuyên-
+    building, `n_matches/residual` một mình có thể xếp hạng 1 cạnh giả xuyên-
+    building CAO HƠN cạnh thật, khiến MWIS loại nhầm cạnh thật ngay từ vòng
+    đầu - GNC downstream không cứu được vì không có input đúng để bắt đầu.
+    `None` (mặc định) = không đổi hành vi cũ.
     Trả về {(a,b): OpeningEdge} cho các cạnh đã được xác nhận (không xung đột).
     """
     names = list(clusters.keys())
@@ -318,6 +327,8 @@ def resolve_opening_conflict_graph(
         for a, b in list(unresolved_pairs):
             cand = _best_direction_opening_edge(a, b, clusters, cams, avail)
             if cand is not None:
+                if prior_weights is not None:
+                    cand.weight *= prior_weights.get((a, b), 1.0)
                 new_candidates.append(cand)
                 if verbose:
                     print(f"  [vòng {round_no}] {a}-{b}: dùng {a}{sorted(i for _, i in cand.used_a)} <-> "
