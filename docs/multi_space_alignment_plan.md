@@ -32,20 +32,38 @@ engine đã có và đã verify của mình (`gravity_align.align_gravity_camera
 
 ## 3. Kế hoạch — 5 giai đoạn
 
-### Giai đoạn 0 — Baseline thực nghiệm (làm ngay, rẻ, không rủi ro)
+### Giai đoạn 0 — Baseline thực nghiệm ✅ ĐÃ CHẠY THẬT
 
-Chạy `align_rooms_to_hub` thật (không phải synthetic) trên `310_indoor`+`server`+`h_server` — bộ 3
-không gian thật duy nhất đã có sẵn point cloud + camera pose. Mục tiêu: có 1 con số baseline thật để
-so sánh với mọi cải tiến sau này, và xác nhận lại (hoặc phủ nhận) giả thuyết ban đầu rằng cách làm cũ
-"nhìn tưởng đúng nhưng globally wrong" trên đúng bộ dữ liệu đã truyền cảm hứng viết hàm này.
+Chạy `align_rooms_to_hub` thật (không phải synthetic) trên `310_indoor`+`server`+`h_server`
+(script: `scripts/align_hub_pipeline.py`). Kết quả thật:
 
-**Deliverable**: 1 script `scripts/align_hub_pipeline.py` (theo đúng khuôn `align_gravity_pipeline.py`
-đã có) + số liệu residual/status thật, không synthetic.
+| Room | Hub opening gán | Matches | Residual |
+|---|---|---|---|
+| server | wall `[0,1,2]` | `(2,2),(3,1)` | 0.2891 |
+| room_310 | wall `[3]` (lẻ, trivial) | `(0,0)` | 0.0 (không có ý nghĩa - 1 điểm luôn fit chính nó) |
 
-### Giai đoạn 1 — Edge construction: thay engine, KHÔNG cần học gì mới
+Kiểm tra bằng mắt: **`room_310` bị ghép SAI** — đè vào đúng 1 cửa lẻ cuối hành lang không phải của
+nó, vì thuật toán gán độc quyền ở cấp **room→CẢ NHÓM TƯỜNG**, không phải room→từng opening. Xác nhận
+lại giả thuyết ban đầu: cách làm cũ "nhìn tưởng đúng nhưng globally wrong" — **đúng**, có bằng chứng
+thật.
 
-Thay vì dùng `align_indoor_outdoor` bên trong `align_rooms_to_hub`, mọi cặp không gian ứng viên
-`(i, j)` chạy qua `align_gravity_camera(clusters_i, clusters_j, cam_i, cam_j)` — cho ra trực tiếp:
+### Giai đoạn 1 — Edge construction: thay engine + sửa granularity ✅ ĐÃ CHẠY THẬT (BASELINE CHÍNH THỨC)
+
+Thay `align_indoor_outdoor` bằng `align_gravity_camera` (script:
+`scripts/align_hub_pipeline_gravity.py`). Lần chạy đầu (gán theo NHÓM TƯỜNG như Giai đoạn 0) vẫn tái
+hiện đúng lỗi granularity trên. **Sửa granularity**: mỗi room chạy trực tiếp trên TOÀN BỘ hub (không
+giới hạn subset theo tường trước), chỉ giải quyết tranh chấp ở cấp **OPENING-INDEX** khi 2 room thật
+sự đòi dùng chung 1 opening cụ thể. Kết quả sau khi sửa — **đây là baseline được xác nhận đúng bằng
+mắt, dùng làm mốc chính thức cho mọi cải tiến sau này**:
+
+| Room | Matches (room_idx, hub_idx) | Status | Residual |
+|---|---|---|---|
+| server | `(4,3),(5,2)` | CONFIDENT | 0.0101 |
+| room_310 | `(0,0),(1,1)` | AMBIGUOUS (2 cửa khá đối xứng, cảnh báo trung thực) | 0.0201 |
+
+`server` matches **trùng khớp trực tiếp** với ground-truth đã biết trước ở mục 11 CONTRIBUTIONS.md
+(`indoor[4]/[5]`), residual giảm 0.2891 → 0.0101 (~28 lần) so với Giai đoạn 0. `room_310` dùng đúng 2
+opening hub còn thừa mà `server` không chạm tới — không còn tranh chấp/gán sai.
 
 - `status` (CONFIDENT/AMBIGUOUS/NO_SOLUTION) → quyết định cạnh `(i,j)` có tồn tại trong đồ thị không (thay cho "ước lượng overlap bằng neural network" của SGHR — ở đây có sẵn tín hiệu vật lý, không cần train).
 - `opening_residual`, `cam_dominance`, `grav_dot`, `up_consistency_A/B` → làm **trọng số/độ tin cậy** của cạnh cho bước tối ưu toàn cục ở Giai đoạn 3 (khắc phục đúng giới hạn (e) đã nêu — hiện tại các con số này bị bỏ phí, chỉ dùng để in log).
@@ -53,15 +71,39 @@ Thay vì dùng `align_indoor_outdoor` bên trong `align_rooms_to_hub`, mọi c�
 **Chi phí**: O(N²) lần gọi `align_gravity_camera` cho N không gian (chấp nhận được vì N thực tế nhỏ,
 < 10 không gian/toà nhà) — không cần lọc ứng viên trước bằng heuristic gì thêm ở quy mô này.
 
-### Giai đoạn 2 — Loại cạnh sai bằng PCM (mượn từ DOOR-SLAM)
+### Giai đoạn 2 — Loại cạnh sai bằng PCM (mượn từ DOOR-SLAM) — ⚠️ ĐÃ THỬ, THẤT BẠI, TẠM DỪNG
 
-Sau Giai đoạn 1 có 1 đồ thị thưa (chỉ cạnh CONFIDENT). Trước khi đưa vào tối ưu toàn cục, áp dụng
-**PCM (pairwise consistent measurement set maximization)** bản tập trung (centralized), không cần bản
-phân tán của DOOR-SLAM: với mọi tập con cạnh tạo thành 1 chu trình (cycle) trong đồ thị, kiểm tra tích
-các transform Sim(3) vòng quanh chu trình có gần `Identity` không (đây chính là "loop closure error" —
-1 chu trình A→B→C→A đúng vật lý thì `T_AB · T_BC · T_CA ≈ I`). Loại cạnh nào liên tục xuất hiện trong
-các chu trình lỗi cao — đây là bước **hoàn toàn không có** trong `align_rooms_to_hub` hiện tại (nó tin
-tuyệt đối vào Hungarian, không tự kiểm tra chéo).
+**Thử nghiệm thật** (4 không gian: thêm `data/connecting_space` vào bộ 3 đã có, script
+`scripts/align_4space_pipeline.py` + `scripts/multi_space_cycle_consistency.py`, không giả định
+trước topology): chạy `align_gravity_camera` cho MỌI cặp trong 4 không gian (6 cặp) — phát hiện
+**3 cạnh false positive thật** (`server↔room_310`, `server↔connecting_space`, `room_310↔connecting_space`
+đều ra CONFIDENT/AMBIGUOUS với residual thấp, dù ground-truth xác nhận bằng mắt là chúng KHÔNG hề kề
+nhau — chỉ `h_server` mới là không gian chung, `connecting_space` nối vào đúng cửa cuối hành lang).
+
+Thử fix bằng loop-consistency (PCM): liệt kê toàn bộ 16 cây khung khả dĩ nối 4 không gian bằng 6 cạnh
+đo được, chọn cây có tổng loop-error thấp nhất. **Kết quả: THẤT BẠI** — cây ground-truth (star vào
+`h_server`) xếp hạng 9/16, không phải thấp nhất; cây có tổng loop-error thấp nhất lại là 1 cây SAI
+(dùng 2 trong 3 cạnh giả).
+
+**Nguyên nhân đã phân tích bằng tổ hợp** (không chỉ dựa vào 1 lần chạy): với đúng cấu trúc "1 hub +
+N cạnh giả nối chéo giữa các room" (đồ thị đầy đủ Kn), MỌI cạnh — kể cả cạnh THẬT — chỉ xuất hiện
+trong các tam giác có lẫn ít nhất 1 cạnh giả (3 cạnh hub tạo thành 1 cây, không có tam giác nào toàn
+cạnh thật để tự xác nhận lẫn nhau). Việc "quy trách nhiệm cho cạnh nào" trong 1 tam giác lỗi là mơ hồ
+toán học thật sự khi topology thật là star thuần — **không đủ dư thừa (redundancy) hình học để tự
+phân biệt, không phải lỗi code**.
+
+**Kết luận (phát hiện âm tính, có giá trị cho phần Discussion/Future Work của bài báo)**: loop-
+consistency/PCM thuần geometric KHÔNG đủ khi topology thật là star (không có chu trình toàn-cạnh-thật
+nào để đối chiếu). Cần 1 trong 2 hướng bổ sung (chưa code, tạm dừng theo quyết định 2026-08-21):
+
+1. **Adjacency prior từ metadata** (mượn ý tưởng `region` đã có ở mục 4b CONTRIBUTIONS.md, mở rộng
+   lên cấp đồ thị N-không-gian) — biết trước cặp nào ĐÁNG thử, không chạy mù toàn bộ C(N,2).
+2. **Thêm redundancy hình học thật** (thu thêm dữ liệu tạo chu trình toàn-cạnh-thật) để PCM có đủ tín
+   hiệu tự xác nhận.
+
+**Quyết định hiện tại**: dùng kết quả Giai đoạn 1 (3 không gian, opening-level, đã verify đúng) làm
+baseline chính thức; việc tổng quát hoá phát hiện topology tự động cho N>3 không gian (không biết
+trước hub) tạm gác lại, chờ hướng giải quyết mới.
 
 ### Giai đoạn 3 — Tối ưu toàn cục: Sim(3) pose-graph / motion averaging (mượn từ SGHR + Multi S-Graphs)
 
