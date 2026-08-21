@@ -141,6 +141,58 @@ nào ở cấp opening/edge cũng PHẢI lặp đến điểm bất động (fix
 (adjacency prior từ metadata thật, không phải suy ra tự động) hoặc hướng 2 (thêm redundancy) - loop-
 consistency thuần geometric đã chứng minh không đủ.
 
+### Giai đoạn 3 (thử KHÔNG cần adjacency prior) — Sim(3) pose-graph robust ⚠️ TỐT NHẤT ĐẾN NAY, CHƯA HOÀN HẢO
+
+Sau phát hiện âm tính ở Giai đoạn 2 (đếm tam giác rời rạc thất bại hoàn toàn - cây ground-truth xếp
+hạng 9/16), quay lại đúng định hướng gốc của Giai đoạn 3: thay đếm tam giác cô lập bằng **tối ưu
+Sim(3) toàn cục** (`src/sgd_alignment/matching/multi_space_graph.py`, script
+`scripts/multi_space_robust_pose_graph.py`) - mọi cạnh cùng tham gia MỘT bài toán bình phương tối
+thiểu robust (`scipy.optimize.least_squares(loss="soft_l1")`), không cần biết trước ai là hub.
+
+**Kết quả tốt nhất tìm được** (cấu hình: KHÔNG chuẩn hoá đơn vị residual, `f_scale=0.1`, trọng số
+`n_matches/opening_residual`, giải 1 lần - không lặp IRLS):
+
+| Cạnh | Loại (ground-truth) | Residual sau tối ưu |
+|---|---|---|
+| h_server-connecting_space | THẬT | 0.08° |
+| h_server-room_310 | THẬT | 0.18° |
+| room_310-connecting_space | GIẢ | 1.25° |
+| h_server-server | THẬT | 2.37° |
+| server-room_310 | GIẢ | 24.74° |
+| server-connecting_space | GIẢ | 155.89° |
+
+Với PCM ngưỡng 5°: **giữ đúng 3/3 cạnh thật, không bỏ sót cạnh nào, chỉ giữ nhầm 1/3 cạnh giả**
+(`room_310-connecting_space`) - tốt hơn HẲN so với đếm tam giác rời rạc (0/1 tách được, xếp hạng sai
+hoàn toàn). Đây là bằng chứng thật cho luận điểm: tối ưu liên tục trên TOÀN BỘ đồ thị có nhiều thông
+tin phân biệt hơn đếm tam giác cô lập.
+
+**3 hướng "cải tiến" đã thử dựa trên suy luận lý thuyết - CẢ 3 ĐỀU THẤT BẠI, xác nhận bằng số liệu
+thật (bài học: không tin suy luận "nghe hợp lý" khi chưa test, luôn có baseline để quay lại)**:
+
+1. **IRLS + history reweighting lặp nhiều vòng (mượn SGHR)**: thay vì giải 1 lần, lặp 8 vòng cập
+   nhật trọng số luỹ tích theo residual. Kết quả: bất ổn, có lúc làm MẤT 1 cạnh thật (`h_server-server`
+   bị đè trọng số xuống 0.05, residual bật lên 39.11°). Giả thuyết nguyên nhân: SGHR thiết kế cho quy
+   mô hàng trăm cạnh (3DMatch/ScanNet); ở N=4/6 cạnh, không đủ dư thừa để trọng số hội tụ ổn định qua
+   nhiều vòng - feedback loop giữa trọng số và nghiệm tự củng cố sai lệch thay vì hội tụ đúng.
+2. **Chuẩn hoá đơn vị residual** (chia riêng góc/tịnh tiến/scale theo "1 đơn vị sai số chấp nhận được"
+   trước khi ghép, để tránh tịnh tiến - đơn vị mét, độ lớn tuyệt đối lớn nhất - áp đảo quyết định
+   outlier của `f_scale`): về lý thuyết hợp lý, nhưng THỰC NGHIỆM làm tệ hơn (cạnh giả `server-room_310`
+   tụt từ 24.74° xuống 1.47°, bị coi là "tốt"). Không rõ nguyên nhân chính xác - có thể chính việc tịnh
+   tiến áp đảo (điều bị coi là "vấn đề") tình cờ lại là tín hiệu phân biệt hữu ích nhất cho đúng bộ dữ
+   liệu này.
+3. **Trọng số từ tín hiệu vật lý** (`cam_dominance × grav_dot × up_consistency` thay vì
+   `n_matches/opening_residual`): thất bại rõ nguyên nhân - đây là các NGƯỠNG GATE NHỊ PHÂN bên trong
+   `align_gravity_camera` (CONFIDENT/AMBIGUOUS nghĩa là đã pass, nên luôn ~0.97-1.0 cho MỌI cạnh kể cả
+   cạnh giả) - gần như không phân biệt được gì, khác hẳn `n_matches/residual` (dao động thật
+   34.6-78.7, phản ánh đúng "khớp tốt tới đâu").
+
+**Kết luận cho phần Discussion của bài báo**: Sim(3) pose-graph robust, giải 1 lần, KHÔNG lặp lịch sử
+và KHÔNG chuẩn hoá đơn vị phức tạp, là cấu hình tốt nhất tìm được cho bài toán "portal-only, N nhỏ" -
+đơn giản hơn nhiều so với các kỹ thuật mượn từ literature (SGHR's history reweighting) vốn được thiết
+kế cho quy mô lớn hơn nhiều. Vẫn còn 1 cạnh giả chưa tách được (`room_310-connecting_space`) - giới
+hạn cấu trúc thật ở N=4 (2 node lá chỉ neo vào hub qua 1 cạnh mỗi bên, transform tương đối giữa chúng
+gần như bị ép cứng sẵn bởi 2 cạnh thật đó, khiến 1 cạnh giả tình cờ không lệch đủ nhiều để lộ ra).
+
 ### Giai đoạn 3 — Tối ưu toàn cục: Sim(3) pose-graph / motion averaging (mượn từ SGHR + Multi S-Graphs)
 
 Thay cơ chế "Hungarian gán room→wall rồi dừng" bằng 1 bước tối ưu toàn cục thật sự:
