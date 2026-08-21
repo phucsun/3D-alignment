@@ -16,6 +16,16 @@ subset theo tường trước) - bản thân hàm đã tự tìm subset khớp t
 Chỉ khi 2 room THẬT SỰ đòi dùng chung đúng 1 hub-opening-index mới cần giải
 quyết tranh chấp (ở cấp OPENING, không phải cấp TƯỜNG).
 
+Giai đoạn 2 (Adjacency prior, docs/multi_space_alignment_plan.md): sau khi
+loop-consistency/PCM thuần geometric thất bại khi không biết trước topology
+(4 không gian, mọi cặp chạy mù - 3 cạnh false positive), quay lại dùng
+ĐÚNG tri thức đã biết trước (giống cơ chế `region` ở mục 4b
+CONTRIBUTIONS.md, áp ở cấp đồ thị): `h_server` LÀ hub đã biết chắc chắn -
+CHỈ test room->hub, không chạy mù các cặp room-room. Thêm
+`connecting_space` làm room thứ 3 (kỳ vọng khớp đúng hub opening index 4 -
+"cửa cuối hành lang" - đúng cái mà `room_310` từng bị gán nhầm vào trước
+khi sửa granularity).
+
 Usage:
     python scripts/align_hub_pipeline_gravity.py
 """
@@ -71,6 +81,9 @@ ROOM_SERVER_NPZ = "data/server/server/results.npz"
 ROOM_310_PLY = "data/310_indoor/310_indoor_points - Cloud - segment.ply"
 ROOM_310_NPZ = "data/310_indoor/results.npz"
 
+CONNECTING_PLY = "data/connecting_space/connecting_space_points - Cloud-segmented.ply"
+CONNECTING_NPZ = "data/connecting_space/results.npz"
+
 
 def main() -> None:
     hub_clusters = openings_from_manual_segmentation(HUB_PLY)
@@ -79,6 +92,7 @@ def main() -> None:
     rooms = {
         "server": (openings_from_manual_segmentation(ROOM_SERVER_PLY), camera_evidence(ROOM_SERVER_NPZ), ROOM_SERVER_PLY),
         "room_310": (openings_from_manual_segmentation(ROOM_310_PLY), camera_evidence(ROOM_310_NPZ), ROOM_310_PLY),
+        "connecting_space": (openings_from_manual_segmentation(CONNECTING_PLY), camera_evidence(CONNECTING_NPZ), CONNECTING_PLY),
     }
     room_names = list(rooms.keys())
 
@@ -100,29 +114,41 @@ def main() -> None:
         print(f"\n[{name}] status={result.status} residual={result.opening_residual:.4f} "
               f"matches(room_idx,hub_idx)={result.matches} reason={result.reason}")
 
-    # ---- bước 2: phát hiện tranh chấp Ở CẤP OPENING (không phải cấp tường) ----
-    hub_idx_owner: dict[int, str] = {}
-    conflicts: set[int] = set()
-    for name, result in results.items():
-        for _, hub_idx in result.matches:
-            if hub_idx in hub_idx_owner and hub_idx_owner[hub_idx] != name:
-                conflicts.add(hub_idx)
-            else:
-                hub_idx_owner[hub_idx] = name
+    # ---- bước 2: phát hiện + giải quyết tranh chấp Ở CẤP OPENING, LẶP đến khi hết
+    # tranh chấp (fixed-point) - loại bỏ 1 vòng duy nhất không đủ: room thua bị loại
+    # opening rồi chạy lại CÓ THỂ tìm ra match mới, lại tranh chấp với 1 room KHÁC
+    # chưa từng bị đụng tới ở vòng trước (xác nhận thật: room_310 thắng {0,1} ở vòng
+    # đầu, connecting_space bị loại {0,3} rồi chạy lại lại vô tình chọn trúng hub-idx
+    # 1 - tranh chấp MỚI với room_310 mà 1 vòng duy nhất không phát hiện ra).
+    MAX_ROUNDS = 10
+    for round_no in range(MAX_ROUNDS):
+        hub_idx_owner: dict[int, str] = {}
+        conflicts: set[int] = set()
+        for name, result in results.items():
+            for _, hub_idx in result.matches:
+                if hub_idx in hub_idx_owner and hub_idx_owner[hub_idx] != name:
+                    conflicts.add(hub_idx)
+                else:
+                    hub_idx_owner[hub_idx] = name
 
-    if conflicts:
-        print(f"\n=== Tranh chấp opening-index: {conflicts} - giải quyết theo status/residual ===")
-        # room thắng giữ nguyên; room thua loại bỏ đúng hub-index tranh chấp khỏi candidate rồi chạy lại
+        if not conflicts:
+            if round_no == 0:
+                print("\nKhông có tranh chấp opening-index nào - mọi room dùng tập opening rời nhau, đều hợp lệ.")
+            else:
+                print(f"\nHết tranh chấp sau {round_no} vòng giải quyết.")
+            break
+
+        print(f"\n=== Vòng {round_no + 1}: tranh chấp opening-index {conflicts} - giải quyết theo status/residual ===")
         losers = set()
         for hub_idx in conflicts:
-            claimants = [n for n, r in results.items() if hub_idx in dict(r.matches)]
+            claimants = [n for n, r in results.items() if hub_idx in {h for _, h in r.matches}]
             best = max(claimants, key=lambda n: (_STATUS_RANK[results[n].status], -results[n].opening_residual))
             for n in claimants:
                 if n != best:
                     losers.add(n)
         for name in losers:
             # loại khỏi candidate mọi hub-index đang tranh chấp mà room này KHÔNG phải chủ thắng
-            available_hub_idx[name] = [i for i in range(len(hub_clusters))
+            available_hub_idx[name] = [i for i in available_hub_idx[name]
                                         if i not in conflicts or hub_idx_owner.get(i) == name]
             room_clusters, cam_room, _ = rooms[name]
             sub_hub = [hub_clusters[i] for i in available_hub_idx[name]]
@@ -133,7 +159,8 @@ def main() -> None:
             print(f"  [{name}] (loại opening tranh chấp) -> status={result.status} "
                   f"residual={result.opening_residual:.4f} matches={result.matches} reason={result.reason}")
     else:
-        print("\nKhông có tranh chấp opening-index nào - cả 2 room dùng tập opening rời nhau, đều hợp lệ.")
+        print(f"\nCẢNH BÁO: vẫn còn tranh chấp sau {MAX_ROUNDS} vòng - dữ liệu có thể không đủ opening "
+              "để tách 2 room, hoặc thuật toán dao động không hội tụ.")
 
     # ---- xuất kết quả ----
     out_dir = Path("outputs/final_aligned")
@@ -155,14 +182,14 @@ def main() -> None:
             cols = np.full((len(pts), 3), 160, np.uint8)
         aligned = transform_points(pts, result.s, result.R, result.t)
 
-        pair_out = out_dir / f"hub3grav_{name}_vs_hub.ply"
+        pair_out = out_dir / f"hubadjgrav_{name}_vs_hub.ply"
         _write_ply(np.concatenate([aligned, hub_pts]), np.concatenate([cols, hub_cols]), str(pair_out))
         print(f"  saved -> {pair_out}")
 
         all_pts.append(aligned)
         all_cols.append(cols)
 
-    combined_out = out_dir / "hub3grav_all_aligned.ply"
+    combined_out = out_dir / "hubadjgrav_all_aligned.ply"
     _write_ply(np.concatenate(all_pts), np.concatenate(all_cols), str(combined_out))
     print(f"\nsaved (cả 3 không gian) -> {combined_out}")
 

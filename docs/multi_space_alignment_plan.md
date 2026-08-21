@@ -101,9 +101,45 @@ nào để đối chiếu). Cần 1 trong 2 hướng bổ sung (chưa code, tạ
 2. **Thêm redundancy hình học thật** (thu thêm dữ liệu tạo chu trình toàn-cạnh-thật) để PCM có đủ tín
    hiệu tự xác nhận.
 
-**Quyết định hiện tại**: dùng kết quả Giai đoạn 1 (3 không gian, opening-level, đã verify đúng) làm
-baseline chính thức; việc tổng quát hoá phát hiện topology tự động cho N>3 không gian (không biết
-trước hub) tạm gác lại, chờ hướng giải quyết mới.
+**Quyết định (2026-08-21)**: đi theo hướng 1 (adjacency prior) - rẻ, khả thi ngay, không cần thu thêm
+dữ liệu. Áp dụng: `h_server` được biết trước là hub duy nhất (từ chính người thu thập dữ liệu, đúng
+tinh thần `region` mục 4b) - chỉ test 3 cặp room→hub, không chạy mù 6 cặp nữa.
+
+**✅ Đã verify thành công trên 4 không gian thật** (`server`, `room_310`, `connecting_space` + hub
+`h_server`, script `scripts/align_hub_pipeline_gravity.py`, đã thêm `connecting_space` làm room thứ
+3): sau khi giới hạn candidate về đúng adjacency prior, kết quả hội tụ đúng ground-truth, đã xác nhận
+bằng mắt:
+
+| Room | Matches (room_idx, hub_idx) | Status | Residual |
+|---|---|---|---|
+| server | `(4,3),(5,2)` | CONFIDENT | 0.0101 |
+| room_310 | `(0,0),(1,1)` | CONFIDENT | 0.0201 |
+| connecting_space | `(1,4)` | AMBIGUOUS (1 match, "khớp hoàn hảo giả tạo" - trivial) | 0.0000 |
+
+3 room dùng đúng 3 tập hub-opening-index **rời nhau hoàn toàn** (`{2,3}`, `{0,1}`, `{4}`) - không còn
+tranh chấp. `connecting_space` tự động rơi đúng vào opening index 4 - chính là "cửa cuối hành lang"
+mà người dùng xác nhận bằng kiến thức thực địa (không suy ra được từ hình học thuần).
+
+**Bug thật phát hiện + sửa khi implement giải quyết tranh chấp cấp-opening** (2 lỗi, không phải 1):
+
+1. **Sai logic kiểm tra claimant**: `hub_idx in dict(r.matches)` biến `[(room_idx, hub_idx), ...]`
+   thành dict với **key = room_idx** (phần tử đầu), không phải `hub_idx` - kiểm tra tranh chấp hoàn
+   toàn sai (đôi khi trùng hợp đúng vì `room_idx == hub_idx`, có lúc cho danh sách rỗng → crash
+   `max() arg is an empty sequence`). Sửa: `hub_idx in {h for _, h in r.matches}`.
+2. **Thiếu vòng lặp fixed-point**: giải quyết tranh chấp chỉ 1 lần là KHÔNG đủ - xác nhận thật trên
+   dữ liệu: sau khi loại `connecting_space` khỏi 2 opening tranh chấp vòng 1, nó chạy lại và tình cờ
+   chọn trúng 1 opening mà `room_310` đang dùng - tranh chấp MỚI phát sinh, vòng kiểm tra 1 lần duy
+   nhất không phát hiện ra. Sửa: lặp đến khi không còn tranh chấp nào (hội tụ sau 3 vòng trên dữ liệu
+   thật này, có giới hạn `MAX_ROUNDS` để tránh treo nếu không hội tụ).
+
+**Bài học tổng quát cho Giai đoạn 3 (thiết kế chính thức sau này)**: bất kỳ cơ chế giải quyết xung đột
+nào ở cấp opening/edge cũng PHẢI lặp đến điểm bất động (fixed-point), không được giả định 1 vòng là
+đủ - đây là lỗi dễ tái diễn nếu tổng quát hoá thành PCM/pose-graph thật ở Giai đoạn 3.
+
+**Giới hạn còn lại (trung thực)**: cách này CẦN biết trước hub - không tự động phát hiện topology
+được (đúng như phát hiện âm tính ở trên). Với N không gian không biết trước cấu trúc, vẫn cần hướng 1
+(adjacency prior từ metadata thật, không phải suy ra tự động) hoặc hướng 2 (thêm redundancy) - loop-
+consistency thuần geometric đã chứng minh không đủ.
 
 ### Giai đoạn 3 — Tối ưu toàn cục: Sim(3) pose-graph / motion averaging (mượn từ SGHR + Multi S-Graphs)
 
