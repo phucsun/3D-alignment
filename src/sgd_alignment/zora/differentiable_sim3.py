@@ -157,3 +157,131 @@ def solve_pose_graph_torch(
             }
 
     return TorchPoseGraphResult(poses=poses, edge_residuals=edge_residuals, loss_history=loss_history)
+
+
+# --------------------------------------------------------------------------------------
+# Giai đoạn 3 (docs/zora_design_plan.md): GNC-TLS (Yang, Antonante, Tzoumas, Carlone,
+# "Graduated Non-Convexity for Robust Spatial Perception", 2020) - THAY cho IRLS tự viết
+# đã THẤT BẠI (bất ổn, làm mất cạnh thật ở quy mô N nhỏ - xem
+# docs/multi_space_alignment_plan.md). Khác biệt cốt lõi với IRLS tự chế trước đó: GNC có
+# LỊCH TRÌNH ANNEALING có công thức toán học rõ ràng (không phải decay tuỳ ý chọn tay),
+# bắt đầu từ 1 surrogate GẦN LỒI (mu nhỏ theo công thức khởi tạo chuẩn) rồi tăng dần độ
+# non-convex - continuation giúp tránh local minima mà IRLS tự viết mắc phải.
+#
+# Dùng scalar "góc lệch" (radian, đã xác nhận là chiều thông tin phân biệt thật/giả tốt
+# nhất trên dữ liệu này - không mix đơn vị góc/tịnh tiến/scale như đã thử và thất bại
+# trước đó) làm residual cho GNC threshold; pose vẫn tối ưu trên đầy đủ 7 chiều.
+# --------------------------------------------------------------------------------------
+@dataclass
+class GNCResult:
+    poses: dict[str, Sim3T]
+    edge_residuals: dict[tuple[str, str], dict]
+    gnc_weights: dict[tuple[str, str], float]  # ~1.0 = inlier (giữ), ~0.0 = outlier (loại)
+    mu_history: list[float]
+
+
+def _gnc_tls_weight(r2: float, mu: float, c2: float) -> float:
+    """Công thức weight update GNC-TLS gốc (Yang et al. 2020, eq. 16)."""
+    if r2 <= (mu / (mu + 1.0)) * c2:
+        return 1.0
+    if r2 >= ((mu + 1.0) / mu) * c2:
+        return 0.0
+    return float((c2 * mu * (mu + 1.0) / r2) ** 0.5 - mu)
+
+
+def solve_pose_graph_gnc(
+    edges: dict[tuple[str, str], tuple[float, "np.ndarray", "np.ndarray"]],
+    names: list[str],
+    root: str,
+    edge_weights: dict[tuple[str, str], float] | None = None,
+    c_deg: float = 5.0,
+    mu_factor: float = 1.4,
+    n_outer: int = 15,
+    n_inner_steps: int = 200,
+    lr: float = 0.05,
+) -> GNCResult:
+    """GNC-TLS trên residual góc (radian). `c_deg`: ngưỡng phân biệt inlier/
+    outlier (độ) - cùng ý nghĩa với ngưỡng PCM=5° đã dùng ở bản numpy, để so
+    sánh trực tiếp được. `edge_weights`: trọng số ưu tiên tiên nghiệm (như
+    `n_matches/residual`) - nhân THÊM vào trọng số GNC (2 loại trọng số độc
+    lập: 1 cái nói "tin đến đâu nếu đúng", 1 cái GNC tự học "có đúng không").
+    """
+    import numpy as np
+    import torch.nn.functional as F  # noqa: F401 (giữ import cho nhất quán, không dùng huber ở đây)
+
+    free_nodes = [n for n in names if n != root]
+    node_idx = {n: i for i, n in enumerate(free_nodes)}
+    edges_t = {k: (torch.tensor(float(s)), torch.tensor(R, dtype=torch.float64),
+                   torch.tensor(t, dtype=torch.float64))
+               for k, (s, R, t) in edges.items()}
+    prior_w = edge_weights or {e: 1.0 for e in edges}
+    c2 = (c_deg * 3.141592653589793 / 180.0) ** 2
+
+    def get_pose(params, name):
+        if name == root:
+            return (torch.tensor(1.0, dtype=torch.float64), torch.eye(3, dtype=torch.float64),
+                    torch.zeros(3, dtype=torch.float64))
+        i = node_idx[name]
+        return params_to_pose(params[i * 7:(i + 1) * 7])
+
+    def edge_angle_sq(params, a, b):
+        Ta, Tb = get_pose(params, a), get_pose(params, b)
+        predicted_ab = compose(invert(Tb), Ta)
+        _, R_err, _ = compose(invert(edges_t[(a, b)]), predicted_ab)
+        return torch.sum(R_log_map(R_err) ** 2)
+
+    def solve_weighted(combined_w: dict, params_init: torch.Tensor, n_steps: int) -> torch.Tensor:
+        params = params_init.clone().detach().requires_grad_(True)
+        optimizer = torch.optim.Adam([params], lr=lr)
+        for _ in range(n_steps):
+            optimizer.zero_grad()
+            loss = torch.tensor(0.0, dtype=torch.float64)
+            for (a, b) in edges_t:
+                Ta, Tb = get_pose(params, a), get_pose(params, b)
+                predicted_ab = compose(invert(Tb), Ta)
+                s_err, R_err, t_err = compose(invert(edges_t[(a, b)]), predicted_ab)
+                res = torch.cat([torch.log(s_err).reshape(1), R_log_map(R_err), t_err])
+                loss = loss + combined_w[(a, b)] * torch.sum(res ** 2)
+            loss.backward()
+            optimizer.step()
+        return params.detach()
+
+    # ---- vòng 0: giải KHÔNG trọng số GNC (chỉ prior_w) để có residual khởi tạo ----
+    params = torch.zeros(len(free_nodes) * 7, dtype=torch.float64)
+    params = solve_weighted(prior_w, params, n_inner_steps)
+    r2 = {e: float(edge_angle_sq(params, *e)) for e in edges_t}
+
+    max_r2 = max(r2.values())
+    mu = c2 / (2 * max_r2 - c2) if max_r2 > c2 / 2 else 1e6  # công thức khởi tạo chuẩn GNC (đảm bảo gần lồi)
+    mu = max(mu, 1e-6)
+    mu_history = [mu]
+    gnc_w = {e: 1.0 for e in edges_t}
+
+    for _ in range(n_outer):
+        for e in edges_t:
+            gnc_w[e] = _gnc_tls_weight(r2[e], mu, c2)
+        combined_w = {e: prior_w.get(e, 1.0) * gnc_w[e] for e in edges_t}
+        params = solve_weighted(combined_w, params, n_inner_steps)
+        r2 = {e: float(edge_angle_sq(params, *e)) for e in edges_t}
+        mu *= mu_factor
+        mu_history.append(mu)
+
+    poses = {root: (torch.tensor(1.0, dtype=torch.float64), torch.eye(3, dtype=torch.float64),
+                     torch.zeros(3, dtype=torch.float64))}
+    for n in free_nodes:
+        poses[n] = get_pose(params, n)
+
+    edge_residuals = {}
+    with torch.no_grad():
+        for (a, b), measured_ab in edges_t.items():
+            Ta, Tb = poses[a], poses[b]
+            predicted_ab = compose(invert(Tb), Ta)
+            s_err, R_err, t_err = compose(invert(measured_ab), predicted_ab)
+            cos_ang = torch.clamp((torch.trace(R_err) - 1.0) / 2.0, -1.0, 1.0)
+            edge_residuals[(a, b)] = {
+                "angle_deg": float(torch.rad2deg(torch.arccos(cos_ang))),
+                "trans_norm": float(torch.linalg.norm(t_err)),
+                "scale_dev": float(abs(torch.log(s_err))),
+            }
+
+    return GNCResult(poses=poses, edge_residuals=edge_residuals, gnc_weights=gnc_w, mu_history=mu_history)
