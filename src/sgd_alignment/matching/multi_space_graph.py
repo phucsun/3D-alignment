@@ -15,10 +15,13 @@ lập thiếu thông tin phân biệt cạnh thật/giả).
 from __future__ import annotations
 
 from dataclasses import dataclass
+from itertools import combinations
 
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.spatial.transform import Rotation
+
+from .gravity_align import align_gravity_camera
 
 
 Sim3 = tuple[float, np.ndarray, np.ndarray]  # (s, R (3,3), t (3,))
@@ -229,3 +232,119 @@ def solve_pose_graph_irls(
 
     return IRLSResult(poses=pg.poses, edge_residuals=pg.edge_residuals, edge_trust=weights,
                        history=history, kept_edges=kept_edges)
+
+
+# --------------------------------------------------------------------------------------
+# Opening-conflict graph (Giai đoạn 3, hướng đã verify TỐT NHẤT: 3/3 cạnh thật, không cần
+# biết trước hub) - mỗi cửa vật lý chỉ được dùng cho ĐÚNG 1 quan hệ; MWIS + lặp loại trừ
+# đến hội tụ. Xem scripts/multi_space_opening_conflict_graph.py cho bối cảnh đầy đủ.
+# --------------------------------------------------------------------------------------
+_STATUS_RANK = {"CONFIDENT": 2, "AMBIGUOUS": 1, "NO_SOLUTION": 0}
+
+
+@dataclass
+class OpeningEdge:
+    a: str
+    b: str
+    s: float
+    R: np.ndarray
+    t: np.ndarray
+    weight: float
+    used_a: frozenset  # {(a, opening_idx), ...}
+    used_b: frozenset  # {(b, opening_idx), ...}
+
+
+def _opening_edges_conflict(c1: OpeningEdge, c2: OpeningEdge) -> bool:
+    return bool((c1.used_a | c1.used_b) & (c2.used_a | c2.used_b))
+
+
+def _best_direction_opening_edge(a, b, clusters, cams, avail) -> OpeningEdge | None:
+    """Tính cạnh (a,b) chỉ trên phần opening CÒN TRỐNG (`avail`) của mỗi bên -
+    thử CẢ 2 CHIỀU `(a,b)`/`(b,a)` (align_gravity_camera không đối xứng, xác
+    nhận thật trên dữ liệu server/h_server: 1 chiều cho residual 0.0674/3 cặp,
+    chiều kia cho 0.0101/2 cặp) - giữ chiều tốt hơn."""
+    idx_a, idx_b = sorted(avail[a]), sorted(avail[b])
+    if not idx_a or not idx_b:
+        return None
+    sub_a = [clusters[a][i] for i in idx_a]
+    sub_b = [clusters[b][i] for i in idx_b]
+
+    r_ab = align_gravity_camera(sub_a, sub_b, cams[a], cams[b])
+    r_ba = align_gravity_camera(sub_b, sub_a, cams[b], cams[a])
+    key_ab = (_STATUS_RANK[r_ab.status], -r_ab.opening_residual)
+    key_ba = (_STATUS_RANK[r_ba.status], -r_ba.opening_residual)
+
+    if r_ab.status == "NO_SOLUTION" and r_ba.status == "NO_SOLUTION":
+        return None
+    if key_ab >= key_ba:
+        result = r_ab
+        matches = [(idx_a[i], idx_b[j]) for i, j in result.matches]
+        s, R, t = result.s, result.R, result.t
+    else:
+        result = r_ba  # A=sub_b, B=sub_a -> match (i local-b, j local-a)
+        matches = [(idx_a[j], idx_b[i]) for i, j in result.matches]
+        s, R, t = invert((result.s, result.R, result.t))
+
+    if not matches:
+        return None
+    weight = len(matches) - result.opening_residual
+    used_a = frozenset((a, i) for i, _ in matches)
+    used_b = frozenset((b, j) for _, j in matches)
+    return OpeningEdge(a, b, s, R, t, weight, used_a, used_b)
+
+
+def resolve_opening_conflict_graph(
+    clusters: dict[str, list],
+    cams: dict,
+    max_rounds: int = 6,
+    verbose: bool = False,
+) -> dict[tuple[str, str], OpeningEdge]:
+    """Tìm tập cạnh (space, space) KHÔNG dùng lại cửa của nhau, tổng trọng số
+    lớn nhất, KHÔNG cần biết trước topology/hub - mỗi vòng: tính lại mọi cạnh
+    chưa khoá chỉ trên phần opening còn trống, chọn MWIS (vét cạn 2^n tập
+    con - n nhỏ nên đủ nhanh), khoá cạnh thắng, lặp đến hội tụ.
+
+    `clusters`: {tên không gian: list[OpeningCluster]}.
+    `cams`: {tên không gian: CameraEvidence}.
+    Trả về {(a,b): OpeningEdge} cho các cạnh đã được xác nhận (không xung đột).
+    """
+    names = list(clusters.keys())
+    avail = {name: set(range(len(clusters[name]))) for name in names}
+    locked_by_pair: dict[tuple[str, str], OpeningEdge] = {}
+    unresolved_pairs = set(combinations(names, 2))
+
+    for round_no in range(1, max_rounds + 1):
+        new_candidates: list[OpeningEdge] = []
+        for a, b in list(unresolved_pairs):
+            cand = _best_direction_opening_edge(a, b, clusters, cams, avail)
+            if cand is not None:
+                new_candidates.append(cand)
+                if verbose:
+                    print(f"  [vòng {round_no}] {a}-{b}: dùng {a}{sorted(i for _, i in cand.used_a)} <-> "
+                          f"{b}{sorted(j for _, j in cand.used_b)}  weight={cand.weight:.3f}")
+
+        pool = list(locked_by_pair.values()) + new_candidates
+        n = len(pool)
+        conflict = [[_opening_edges_conflict(pool[i], pool[j]) if i != j else False for j in range(n)]
+                    for i in range(n)]
+
+        best_subset, best_weight = [], -1.0
+        for mask in range(1 << n):
+            idx = [i for i in range(n) if mask & (1 << i)]
+            if any(conflict[i][j] for i in idx for j in idx if i < j):
+                continue
+            w = sum(pool[i].weight for i in idx)
+            if w > best_weight:
+                best_weight, best_subset = w, idx
+
+        winners = [pool[i] for i in best_subset]
+        newly_locked = [c for c in winners if (c.a, c.b) not in locked_by_pair]
+        if not newly_locked:
+            break
+        for c in newly_locked:
+            for space, i in c.used_a | c.used_b:
+                avail[space].discard(i)
+            unresolved_pairs.discard((c.a, c.b))
+            locked_by_pair[(c.a, c.b)] = c
+
+    return locked_by_pair

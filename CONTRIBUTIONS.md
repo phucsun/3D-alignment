@@ -344,6 +344,69 @@ trên `Q815` (door-only, không có window thật): residual giảm từ 0.0879 
 
 ---
 
+## 12. Ghép N không gian không cần biết trước topology (opening-conflict graph) ✅
+
+**File:** `src/sgd_alignment/matching/multi_space_graph.py` (`resolve_opening_conflict_graph`,
+`OpeningEdge`), `scripts/multi_space_*.py` (nhiều script thử nghiệm/verify), `docs/multi_space_alignment_plan.md`
+(nhật ký đầy đủ, kể cả các hướng thất bại)
+
+**Bối cảnh:** mở rộng bài toán từ 2 không gian (bài gốc) lên N không gian, khi KHÔNG biết trước
+không gian nào là "hub" (không gian chung) hay cặp nào thực sự kề nhau. Đây cũng là baseline
+"không có prior tôpô" (geometry-only) cho hướng nghiên cứu tiếp theo (ZORA — dùng VLM đọc sketch/mô
+tả ngôn ngữ làm prior tôpô "mềm") — nếu sau này thêm VLM prior, đây chính là cột mốc so sánh
+"corruption=100%/không có prior nào cả".
+
+**Đã thử và LOẠI BỎ 3 hướng** (ghi đầy đủ nguyên nhân trong `docs/multi_space_alignment_plan.md`,
+không giấu thất bại):
+1. Đếm tam giác rời rạc (loop-consistency thuần hình học) — thất bại hoàn toàn khi topology thật là
+   star (không có tam giác nào toàn cạnh thật để tự đối chiếu).
+2. Sim(3) pose-graph robust 1 lần (`solve_pose_graph`, `soft_l1`) — tốt hơn hẳn (3/3 cạnh thật, 1/3
+   cạnh giả còn sót) nhưng chưa dùng được ý nghĩa vật lý của cửa.
+3. IRLS lặp nhiều vòng (mượn history-reweighting của SGHR) + p-value thống kê (null distribution từ
+   cặp không liên quan) + va chạm thể tích toàn phòng — **cả 3 đều thất bại/gây bất ổn** ở quy mô N
+   nhỏ (4-10 không gian thật hiện có) khi kiểm chứng bằng số liệu thật.
+
+**Giải pháp đúng gốc (do người dùng chỉ ra: "bỏ mất ý nghĩa của các cái cửa")**: mỗi opening vật lý
+(`(không gian, chỉ số opening)`) chỉ được dùng cho ĐÚNG 1 quan hệ liên-không-gian — không được 2 cạnh
+khác nhau dùng chung 1 cửa. Thuật toán `resolve_opening_conflict_graph`:
+1. Mỗi cạnh ứng viên đo bằng CẢ 2 CHIỀU `(a,b)`/`(b,a)` — xác nhận thật `align_gravity_camera` KHÔNG
+   đối xứng (đổi vai trò A/B cho cùng 1 cặp cho residual khác nhau thật sự, có lần chênh 6.7 lần:
+   0.0101 vs 0.0674) — giữ chiều tốt hơn.
+2. Tìm tập cạnh KHÔNG dùng chung cửa nào, tổng trọng số lớn nhất (MWIS, vét cạn `2^n` tập con — n
+   nhỏ nên đủ nhanh, nghiệm chính xác).
+3. LẶP: khoá cạnh thắng, loại cửa đã dùng khỏi pool còn trống, TÍNH LẠI mọi cạnh chưa khoá chỉ trên
+   phần cửa còn lại — lặp đến hội tụ (fixed-point). Bước lặp này bắt buộc: nếu chỉ tính 1 lần rồi lọc
+   xung đột, 1 cạnh thật thua cuộc (vì trùng cửa với cạnh khác thắng) sẽ bị loại vĩnh viễn dù nó có
+   thể tìm ra correspondence ĐÚNG KHÁC nếu được tính lại trên phần cửa còn trống.
+
+**Kiểm chứng trên nhiều kịch bản dữ liệu thật độc lập** (không chỉ 1 bộ dùng để phát triển thuật
+toán):
+
+| Kịch bản | Kết quả |
+|---|---|
+| N=2, `q1` (đã biết đúng trước) | 1/1 đúng, 0 giả, 0 bỏ sót |
+| N=2, `chua_thay` (đã biết đúng trước) | 1/1 đúng (5/5 opening), 0 giả, 0 bỏ sót |
+| N=3, `server`+`room_310`+`h_server` (không cho biết hub) | 2/2 đúng, 0 giả, 0 bỏ sót — hoàn hảo |
+| N=4, thêm `connecting_space` (không cho biết hub) | 3/3 đúng, 1 cạnh giả còn sót (`server-connecting_space`, dùng đúng "cửa dư" của cả 2 bên không thuộc quan hệ nào trong 4 không gian đang xét — giới hạn thông tin thật, không phải lỗi thuật toán) |
+
+**Giới hạn đã xác nhận bằng thực nghiệm (spot-check 4 cặp xuyên-building cố ý)**: cơ chế loại-trừ-
+cửa-trùng CHỈ bắt được xung đột khi 2 cạnh THẬT SỰ dùng chung 1 cửa cụ thể — không bắt được trường
+hợp 2 không gian hoàn toàn không liên quan (khác building) tình cờ khớp hình học (vì chúng không
+dùng chung cửa nào để xung đột). Xác nhận: `server <-> q1_indoor` (2 building khác nhau, chắc chắn
+không liên quan) vẫn ra CONFIDENT, residual=0.0212, 2 match — thấp hơn cả 1 vài cạnh THẬT đã biết
+(`h_server-server`=0.0674). **Không nên chạy thuật toán này mù trên nhiều building không liên quan
+cùng lúc** khi chưa có thêm prior tôpô (adjacency prior từ metadata, hoặc VLM prior — xem hướng
+ZORA) để giới hạn trước cặp nào đáng thử.
+
+**Giới hạn phạm vi khác:** chỉ áp dụng cho dữ liệu có camera pose (`align_gravity_camera`) — dữ liệu
+LiDAR thuần (`sc1/sc2_room*`, `vkist_lidar_pantry`) không có `results.npz` nên không dùng được cách
+này; `sc2_room1..5` trông giống 1 bài toán N=5-room-hub thật (5 file "outdoor" có bounding box/centroid
+tương đồng, khả năng cùng 1 hành lang scan riêng biệt) nhưng CHƯA được đăng ký (registration) chung
+với nhau thành 1 hub thống nhất — cần thêm bước tiền xử lý (multi-way point cloud registration, xem
+`docs/related_work/SGHR_...md`) trước khi test được, chưa làm.
+
+---
+
 ## Bảng tổng hợp dataset đã regression-test (sau toàn bộ thay đổi C1–C7)
 
 | Dataset | Nguồn | Match | Residual |
